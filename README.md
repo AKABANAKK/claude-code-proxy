@@ -42,10 +42,12 @@ curl -fsSL https://raw.githubusercontent.com/raine/claude-code-proxy/main/script
 Windows and other prebuilt artifacts are available from
 [GitHub Releases](https://github.com/raine/claude-code-proxy/releases).
 
-Sign in with a **ChatGPT Plus or Pro account**, not an OpenAI API account:
+Sign in with the Codex CLI using a **ChatGPT Plus or Pro account**, not an
+OpenAI API account. The proxy reads the credentials the Codex CLI stores in
+`~/.codex/auth.json` and has no Codex login of its own:
 
 ```sh
-claude-code-proxy codex auth login
+codex login
 ```
 
 Start the proxy in one terminal:
@@ -81,10 +83,46 @@ curl http://127.0.0.1:18765/v1/images/generations \
 
 The opt-in Images API returns base64 image data and consumes the signed-in account's image quota. Image prompts and payloads are excluded from traffic captures. See the [HTTP API](https://claude-code-proxy.raine.dev/reference/http-api/) for generation and edit schemas.
 
+## Claude and Codex on one proxy
+
+`claude-*` models and the `opus`, `sonnet`, and `haiku` aliases are relayed to
+`api.anthropic.com` byte for byte with Claude Code's own subscription login, so
+no Anthropic API key is needed. `gpt-*` models go to Codex through the ChatGPT
+login above. Both run in the same session and can be switched mid-conversation
+with `/model`; reasoning from the previous backend is carried across the switch
+as tagged text.
+
+Leave `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` unset. Claude Code forwards
+its subscription login only when no explicit token is present; setting either
+one sends that value instead and the Claude route returns 401.
+
+```sh
+ANTHROPIC_BASE_URL=http://127.0.0.1:18765 \
+ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-8 \
+ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-6-astra \
+  claude
+```
+
+`/model opus` then uses the Claude subscription and `/model gpt-6-astra` uses
+the ChatGPT subscription. `CCP_ANTHROPIC_BASE_URL` overrides the Anthropic
+upstream. Codex credentials are read from `~/.codex/auth.json`; `CODEX_HOME` or
+`CCP_CODEX_AUTH_FILE` points the proxy at another file, and refreshed tokens are
+written back so the Codex CLI keeps working.
+
+Claude Code turns on its `/effort` menu by matching the model id against its own
+patterns, so a `gpt-*` id gets no effort menu until its capabilities are declared
+as a custom picker entry:
+
+```sh
+export ANTHROPIC_CUSTOM_MODEL_OPTION="gpt-6-astra"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES="effort,xhigh_effort,max_effort"
+```
+
 ## Providers
 
 | Provider     | Account                        | Model selection                                 |
 | ------------ | ------------------------------ | ----------------------------------------------- |
+| Claude       | Claude subscription (Claude Code's own login) | `claude-*` models and the `opus`, `sonnet`, `haiku` aliases |
 | Codex        | ChatGPT Plus or Pro            | Registered `gpt-*` models and `-fast` variants  |
 | Kimi         | kimi.com with Kimi Code access | `kimi-for-coding` and aliases                   |
 | Grok         | grok.com                       | Registered Grok models                          |

@@ -40,17 +40,37 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     }
 }
 
-/// Write a valid auth.json for `provider` under `config_dir`.
-fn write_auth(config_dir: &std::path::Path, provider: &str) {
-    let dir = config_dir.join(provider);
+/// Write a valid Kimi auth.json under `config_dir`.
+fn write_kimi_auth(config_dir: &std::path::Path) {
+    let dir = config_dir.join("kimi");
     std::fs::create_dir_all(&dir).unwrap();
-    let expires: i64 = 4102444800000;
-    let auth = if provider == "codex" {
-        json!({"access":"test-access","refresh":"test-refresh","expires":expires,"account_id":"acct_test"})
-    } else {
-        json!({"access":"test-access","refresh":"test-refresh","expires":expires,"scope":"openid","userId":"user_test"})
-    };
+    let auth = json!({
+        "access": "test-access",
+        "refresh": "test-refresh",
+        "expires": 4102444800000_i64,
+        "scope": "openid",
+        "userId": "user_test"
+    });
     std::fs::write(dir.join("auth.json"), serde_json::to_vec(&auth).unwrap()).unwrap();
+}
+
+/// Write a Codex CLI style `auth.json` and point the proxy at it for the test's
+/// lifetime. The proxy reads Codex credentials from the Codex CLI file, not the
+/// proxy config dir, so tests must set `CCP_CODEX_AUTH_FILE` to stay hermetic
+/// instead of falling back to the developer's real `~/.codex/auth.json`.
+fn write_codex_auth(config_dir: &std::path::Path) -> EnvGuard {
+    let dir = config_dir.join("codex");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("auth.json");
+    let auth = json!({
+        "tokens": {
+            "access_token": "test-access",
+            "refresh_token": "test-refresh",
+            "account_id": "acct_test"
+        }
+    });
+    std::fs::write(&path, serde_json::to_vec(&auth).unwrap()).unwrap();
+    EnvGuard::set("CCP_CODEX_AUTH_FILE", path)
 }
 
 struct EnvGuard {
@@ -262,7 +282,7 @@ async fn assert_codex_http_retries_structural_body_error(first_body: Vec<u8>) {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let success_body = concat!(
@@ -309,7 +329,7 @@ async fn assert_codex_http_presemantic_retry(first_response: Vec<u8>) {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let first_response = Arc::new(first_response);
@@ -947,7 +967,7 @@ fn smoke_kimi_model_is_registered() {
 async fn smoke_kimi_messages_uses_mock_upstream() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "kimi");
+    write_kimi_auth(config.path());
 
     let captured = Arc::new(Mutex::new(None));
     let upstream = spawn_http_upstream({
@@ -996,7 +1016,7 @@ async fn smoke_kimi_messages_uses_mock_upstream() {
 async fn smoke_codex_http_messages_uses_mock_upstream() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let captured = Arc::new(Mutex::new(None));
     let upstream = spawn_http_upstream({
@@ -1039,7 +1059,7 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
 async fn smoke_codex_native_responses_preserves_parallel_tool_calls() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let captured = Arc::new(Mutex::new(None));
     let upstream = spawn_http_upstream({
@@ -1125,7 +1145,7 @@ async fn smoke_codex_http_retries_empty_completion() {
     let _guard = env_lock();
     let _delay_guard = ZeroRetryDelayGuard::enable();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let upstream = spawn_http_upstream({
@@ -1168,7 +1188,7 @@ async fn smoke_codex_http_retries_empty_message_completion() {
     let _guard = env_lock();
     let _delay_guard = ZeroRetryDelayGuard::enable();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let upstream = spawn_http_upstream({
@@ -1207,7 +1227,7 @@ async fn smoke_codex_http_stream_retries_empty_completion() {
     let _guard = env_lock();
     let _delay_guard = ZeroRetryDelayGuard::enable();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let upstream = spawn_http_upstream({
@@ -1258,7 +1278,7 @@ async fn smoke_codex_http_empty_completions_exhaust_to_service_unavailable() {
     let _guard = env_lock();
     let _delay_guard = ZeroRetryDelayGuard::enable();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let upstream = spawn_http_upstream({
@@ -1303,7 +1323,7 @@ async fn smoke_codex_http_empty_completions_exhaust_to_service_unavailable() {
 async fn smoke_auto_review_uses_codex_default_and_configured_override() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let captured = Arc::new(Mutex::new(Vec::new()));
     let upstream = spawn_http_upstream({
@@ -1374,7 +1394,7 @@ async fn smoke_codex_http_server_compaction_replays_native_history() {
     let _guard = env_lock();
     clear_all_compactions_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let captured = Arc::new(Mutex::new(Vec::new()));
     let upstream = spawn_http_upstream({
@@ -1490,7 +1510,7 @@ async fn smoke_codex_http_compaction_failure_preserves_portable_summary() {
     let _guard = env_lock();
     clear_all_compactions_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let captured = Arc::new(Mutex::new(Vec::new()));
     let upstream = spawn_http_upstream({
@@ -1549,7 +1569,7 @@ async fn smoke_codex_http_compaction_failure_preserves_portable_summary() {
 async fn smoke_codex_http_context_window_error_requests_compaction() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let upstream = spawn_http_upstream(|_body: Value| {
         "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"input exceeds context window\"}}}\n\n"
@@ -1586,7 +1606,7 @@ async fn smoke_codex_http_traffic_capture_writes_upstream_artifacts() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let upstream = spawn_http_upstream(|_body: Value| {
         concat!(
@@ -1634,7 +1654,7 @@ async fn smoke_codex_http_stream_traffic_captures_downstream_events() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let upstream = spawn_http_upstream(|_body: Value| {
         concat!(
@@ -1679,7 +1699,7 @@ async fn smoke_codex_http_stream_traffic_captures_downstream_events() {
 async fn smoke_codex_http_stream_returns_before_upstream_completion() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let release = Arc::new(tokio::sync::Notify::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1853,7 +1873,7 @@ async fn smoke_codex_http_incomplete_after_text_is_an_error() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let upstream = spawn_http_upstream(|_body: Value| {
         concat!(
@@ -1899,7 +1919,7 @@ async fn smoke_codex_http_preserves_permanent_policy_failure() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let upstream = spawn_http_upstream({
@@ -1934,7 +1954,7 @@ async fn smoke_codex_http_rate_limit_snapshot_does_not_end_response() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let upstream = spawn_http_upstream({
@@ -1985,7 +2005,7 @@ async fn smoke_codex_http_bounds_initial_status_retries() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2041,7 +2061,7 @@ async fn smoke_codex_http_retries_presemantic_invalid_utf8() {
 async fn smoke_codex_http_does_not_retry_overload_after_semantic_output() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let upstream = spawn_http_upstream({
@@ -2098,7 +2118,7 @@ async fn smoke_codex_http_stops_after_retry_limit() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let upstream = spawn_http_upstream({
@@ -2148,7 +2168,7 @@ async fn smoke_codex_http_cancels_retry_backoff_when_request_drops() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let upstream = spawn_http_upstream({
@@ -2198,7 +2218,7 @@ async fn smoke_codex_http_body_error_after_semantic_output_preserves_message() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let upstream = spawn_truncated_http_upstream(concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\"}}\n\n",
@@ -2248,7 +2268,7 @@ async fn smoke_codex_http_body_error_after_closed_tool_is_not_success() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let upstream = spawn_truncated_http_upstream(concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool_partial\"}}\n\n",
@@ -2289,7 +2309,7 @@ async fn smoke_codex_http_truncated_upstream_writes_reducer_diagnostic() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let upstream = spawn_http_upstream(|_body: Value| {
         concat!(
@@ -2333,7 +2353,7 @@ async fn smoke_codex_http_truncated_upstream_writes_reducer_diagnostic() {
 async fn smoke_codex_websocket_messages_uses_mock_upstream() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
     clear_codex_websocket_pool_for_tests();
 
     let captured = Arc::new(Mutex::new(None));
@@ -2376,7 +2396,7 @@ async fn smoke_codex_websocket_messages_uses_mock_upstream() {
 async fn smoke_codex_websocket_uses_credits_after_included_limit() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
     clear_codex_websocket_pool_for_tests();
 
     let upstream = spawn_websocket_credited_rate_limit_upstream().await;
@@ -2405,7 +2425,7 @@ async fn smoke_codex_websocket_uses_credits_after_included_limit() {
 async fn smoke_codex_websocket_stream_uses_credits_after_included_limit() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
     clear_codex_websocket_pool_for_tests();
 
     let upstream = spawn_websocket_credited_rate_limit_upstream().await;
@@ -2442,7 +2462,7 @@ async fn smoke_codex_websocket_stream_uses_credits_after_included_limit() {
 async fn smoke_codex_websocket_stream_returns_delta_before_terminal() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
     clear_codex_websocket_pool_for_tests();
 
     let upstream = spawn_websocket_delayed_terminal_upstream().await;
@@ -2496,7 +2516,7 @@ async fn smoke_codex_websocket_stream_returns_delta_before_terminal() {
 async fn smoke_codex_websocket_context_window_error_requests_compaction() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
     clear_codex_websocket_pool_for_tests();
 
     let upstream = spawn_websocket_error_upstream("input exceeds context window").await;
@@ -2534,7 +2554,7 @@ async fn smoke_codex_websocket_context_window_error_requests_compaction() {
 async fn smoke_codex_websocket_stream_uses_previous_response_id() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
     clear_codex_websocket_pool_for_tests();
     clear_all_continuations_for_tests();
 
@@ -2600,7 +2620,7 @@ async fn smoke_codex_websocket_stream_uses_previous_response_id() {
 async fn smoke_codex_websocket_stream_retries_missing_previous_response_id() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
     clear_codex_websocket_pool_for_tests();
     clear_all_continuations_for_tests();
 
@@ -2664,7 +2684,7 @@ async fn smoke_codex_websocket_stream_retries_missing_previous_response_id() {
 async fn smoke_codex_websocket_stream_retries_empty_close_with_full_context() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
     clear_codex_websocket_pool_for_tests();
     clear_all_continuations_for_tests();
 
@@ -2744,7 +2764,7 @@ async fn smoke_codex_websocket_stream_retries_terminal_only_completion_with_full
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
     clear_codex_websocket_pool_for_tests();
     clear_all_continuations_for_tests();
 
@@ -2828,7 +2848,7 @@ async fn smoke_codex_websocket_empty_completions_exhaust_to_service_unavailable(
     let _guard = env_lock();
     let _delay_guard = ZeroRetryDelayGuard::enable();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
     clear_codex_websocket_pool_for_tests();
     clear_all_continuations_for_tests();
 
@@ -2877,7 +2897,7 @@ async fn smoke_codex_websocket_empty_completions_exhaust_to_service_unavailable(
 async fn smoke_codex_websocket_previous_response_id_sends_delta_on_second_turn() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
     clear_codex_websocket_pool_for_tests();
     clear_all_continuations_for_tests();
 
@@ -2975,7 +2995,7 @@ async fn smoke_codex_websocket_traffic_capture_writes_upstream_artifacts() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
     clear_codex_websocket_pool_for_tests();
 
     let captured = Arc::new(Mutex::new(None));

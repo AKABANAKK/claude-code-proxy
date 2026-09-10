@@ -682,7 +682,7 @@ async fn context_window_hint_is_removed_before_provider_dispatch() {
 
 #[tokio::test]
 async fn opus_5_alias_routes_to_provider() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new(AliasProvider::Codex)));
     let response = app
         .oneshot(
             Request::builder()
