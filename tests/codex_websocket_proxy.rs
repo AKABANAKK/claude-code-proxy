@@ -84,6 +84,7 @@ fn clear_proxy_environment() -> Vec<EnvGuard> {
 fn configure_codex(config_dir: &Path, base_url: &str) -> Vec<EnvGuard> {
     vec![
         EnvGuard::set("CCP_CONFIG_DIR", config_dir),
+        EnvGuard::set("CCP_CODEX_AUTH_FILE", config_dir.join("codex/auth.json")),
         EnvGuard::set("CCP_ALIAS_PROVIDER", "codex"),
         EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket"),
         EnvGuard::set("CCP_CODEX_BASE_URL", base_url),
@@ -98,10 +99,11 @@ fn write_codex_auth(config_dir: &Path) {
     std::fs::write(
         dir.join("auth.json"),
         serde_json::to_vec(&json!({
-            "access": "test-access",
-            "refresh": "test-refresh",
-            "expires": 4_102_444_800_000_i64,
-            "account_id": "acct_test"
+            "tokens": {
+                "access_token": "test-access",
+                "refresh_token": "test-refresh",
+                "account_id": "acct_test"
+            }
         }))
         .unwrap(),
     )

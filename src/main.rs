@@ -207,10 +207,7 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
             claude_code_proxy::provider::AuthCommand::Status => {
                 if let Err(err) = handlers.status() {
                     println!("{err}");
-                    if err.to_string() == "Not authenticated" {
-                        std::process::exit(1);
-                    }
-                    std::process::exit(2);
+                    std::process::exit(1);
                 }
                 Ok(())
             }
@@ -224,7 +221,7 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
 
 fn print_models(registry: &Registry, full: bool) {
     let grouped = registry.grouped_models();
-    for provider in ["codex", "kimi", "grok", "opencode", "cursor"] {
+    for provider in ["anthropic", "codex", "kimi", "grok", "opencode", "cursor"] {
         let Some(models) = grouped.get(provider) else {
             continue;
         };

@@ -8,7 +8,7 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::config;
 use crate::providers::translate_shared::{
     ContentBlock, flatten_system_text, image_source_to_url, normalize_content, parallel_tool_calls,
-    read_effort,
+    read_effort, wrap_reasoning,
 };
 
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
@@ -945,18 +945,24 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                                 arguments: args,
                             });
                         }
-                        ContentBlock::Thinking { signature, .. } => {
-                            let Some(replay) =
+                        ContentBlock::Thinking {
+                            thinking,
+                            signature,
+                        } => {
+                            if let Some(replay) =
                                 signature.as_deref().and_then(decode_reasoning_signature)
-                            else {
-                                continue;
-                            };
-                            flush_text(&mut out, &mut text_parts);
-                            out.push(ResponsesInputItem::Reasoning {
-                                id: replay.id,
-                                summary: Vec::new(),
-                                encrypted_content: replay.encrypted_content,
-                            });
+                            {
+                                flush_text(&mut out, &mut text_parts);
+                                out.push(ResponsesInputItem::Reasoning {
+                                    id: replay.id,
+                                    summary: Vec::new(),
+                                    encrypted_content: replay.encrypted_content,
+                                });
+                            } else if !thinking.is_empty() {
+                                text_parts.push(ResponsesContentPart::OutputText {
+                                    text: wrap_reasoning(thinking),
+                                });
+                            }
                         }
                         _ => {}
                     }
@@ -2011,6 +2017,39 @@ mod tests {
         .unwrap();
         let out = translate_request(&req, opts()).unwrap();
         assert_eq!(out.input.len(), 2);
+    }
+
+    #[test]
+    fn translate_assistant_thinking_becomes_tagged_reasoning() {
+        // Symmetric with the anthropic passthrough: on an opus->codex switch a replayed
+        // thinking block has no Responses container, so it is carried as tagged text
+        // rather than dropped.
+        use crate::providers::translate_shared::{REASONING_CLOSE, REASONING_OPEN};
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"assistant", "content": [
+                {"type":"thinking", "thinking":"opus reasoning", "signature":"sig"},
+                {"type":"text", "text":"the answer"}
+            ]}]
+        }))
+        .unwrap();
+        let out = translate_request(&req, opts()).unwrap();
+        assert_eq!(out.input.len(), 1);
+        let ResponsesInputItem::Message { role, content } = &out.input[0] else {
+            panic!("expected Message");
+        };
+        assert_eq!(role, "assistant");
+        assert_eq!(content.len(), 2);
+        let ResponsesContentPart::OutputText { text: reasoning } = &content[0] else {
+            panic!("expected reasoning OutputText");
+        };
+        assert!(reasoning.starts_with(REASONING_OPEN), "{reasoning}");
+        assert!(reasoning.contains("opus reasoning"), "{reasoning}");
+        assert!(reasoning.ends_with(REASONING_CLOSE), "{reasoning}");
+        let ResponsesContentPart::OutputText { text: answer } = &content[1] else {
+            panic!("expected answer OutputText");
+        };
+        assert_eq!(answer, "the answer");
     }
 
     #[test]
