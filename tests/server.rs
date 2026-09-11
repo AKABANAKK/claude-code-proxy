@@ -2,11 +2,15 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::IntoResponse;
+use bytes::Bytes;
 use claude_code_proxy::{
     MessagesRequest,
     config::AliasProvider,
     monitor::{MonitorHandle, RequestStatus},
-    provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
+    provider::{
+        CliHandlers, Generation, GenerationBody, Passthrough, Provider, ProviderError,
+        RequestContext,
+    },
     registry::Registry,
     request_identity::ConversationIdentity,
     server::{
@@ -15,7 +19,10 @@ use claude_code_proxy::{
     },
 };
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use tower::util::ServiceExt;
 
 fn body_string(json: &str) -> Body {
@@ -239,6 +246,153 @@ impl Provider for IdentityCaptureProvider {
     }
 }
 
+struct TrackedBodyOwner {
+    bytes: Vec<u8>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl AsRef<[u8]> for TrackedBodyOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for TrackedBodyOwner {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+struct CapturedRawRequest {
+    model: Option<String>,
+    count_tokens: bool,
+    passthrough: Option<Passthrough>,
+}
+
+struct RawRequestProvider {
+    provider: FakeProvider,
+    owner_dropped: Arc<AtomicBool>,
+    captured: Arc<Mutex<Option<CapturedRawRequest>>>,
+}
+
+impl RawRequestProvider {
+    fn capture(
+        &self,
+        body: MessagesRequest,
+        context: RequestContext,
+        count_tokens: bool,
+    ) -> axum::response::Response {
+        assert_eq!(
+            self.owner_dropped.load(Ordering::SeqCst),
+            self.name() == "codex",
+            "{} のProviderメソッド入口での入力原文の解放状態",
+            self.name(),
+        );
+        assert_eq!(
+            context.passthrough.is_none(),
+            self.name() == "codex",
+            "{} のProviderメソッド入口でのpassthroughの有無",
+            self.name(),
+        );
+        assert_eq!(context.provider, self.name());
+        *self.captured.lock().unwrap() = Some(CapturedRawRequest {
+            model: body.model,
+            count_tokens,
+            passthrough: context.passthrough,
+        });
+        (StatusCode::OK, "captured").into_response()
+    }
+}
+
+#[async_trait]
+impl Provider for RawRequestProvider {
+    fn name(&self) -> &'static str {
+        self.provider.name()
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        self.provider.supported_models()
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        body: MessagesRequest,
+        context: RequestContext,
+    ) -> axum::response::Response {
+        self.capture(body, context, false)
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        body: MessagesRequest,
+        context: RequestContext,
+    ) -> axum::response::Response {
+        self.capture(body, context, true)
+    }
+}
+
+async fn assert_raw_request_lifetime(
+    path: &str,
+    request_body: Value,
+    expected_model: &str,
+    alias_provider: AliasProvider,
+    provider: FakeProvider,
+    original_provider: Option<FakeProvider>,
+) {
+    let owner_dropped = Arc::new(AtomicBool::new(false));
+    let captured = Arc::new(Mutex::new(None));
+    let provider = Arc::new(RawRequestProvider {
+        provider,
+        owner_dropped: owner_dropped.clone(),
+        captured: captured.clone(),
+    }) as Arc<dyn Provider>;
+    let mut providers = vec![provider];
+    if let Some(original_provider) = original_provider {
+        providers.push(Arc::new(original_provider));
+    }
+    let app = app_with_features(
+        Arc::new(Registry::from_providers(alias_provider, providers)),
+        None,
+        AppFeatures::default(),
+    );
+    let raw_body = format!("{}\n", serde_json::to_string_pretty(&request_body).unwrap());
+    let path_and_query = format!("{path}?beta=true&tag=a%2Fb&tag=c+d");
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(path_and_query.as_str())
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header("x-original-header", "first")
+        .header("x-original-header", "second")
+        .body(Body::from(Bytes::from_owner(TrackedBodyOwner {
+            bytes: raw_body.as_bytes().to_vec(),
+            dropped: owner_dropped.clone(),
+        })))
+        .unwrap();
+    let expected_headers = request.headers().clone();
+    assert!(!owner_dropped.load(Ordering::SeqCst));
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let captured = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("リクエストが検査用Providerへ配送される");
+    assert_eq!(captured.model.as_deref(), Some(expected_model));
+    assert_eq!(captured.count_tokens, path == "/v1/messages/count_tokens");
+    if let Some(passthrough) = captured.passthrough {
+        assert_eq!(passthrough.raw_body.as_ref(), raw_body.as_bytes());
+        assert_eq!(passthrough.headers, expected_headers);
+        assert_eq!(passthrough.path_and_query, path_and_query);
+    }
+    assert!(owner_dropped.load(Ordering::SeqCst));
+}
+
 fn routed_registry() -> Arc<Registry> {
     Arc::new(Registry::from_providers(
         AliasProvider::Kimi,
@@ -393,6 +547,156 @@ async fn messages_ingress_forwards_only_strict_conversation_identity() {
             (None, Some("session-auto-review".to_string())),
         ]
     );
+}
+
+#[tokio::test]
+async fn codex_messages_release_raw_body_before_dispatch() {
+    for stream in [false, true] {
+        assert_raw_request_lifetime(
+            "/v1/messages",
+            json!({
+                "model": "gpt-5.5[1m]",
+                "stream": stream,
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            "gpt-5.5",
+            AliasProvider::Codex,
+            FakeProvider {
+                name: "codex",
+                models: vec!["gpt-5.5".to_string()],
+            },
+            None,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn codex_count_tokens_release_raw_body_before_dispatch() {
+    assert_raw_request_lifetime(
+        "/v1/messages/count_tokens",
+        json!({
+            "model": "gpt-5.5[1m]",
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+        "gpt-5.5",
+        AliasProvider::Codex,
+        FakeProvider {
+            name: "codex",
+            models: vec!["gpt-5.5".to_string()],
+        },
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn claude_alias_to_codex_releases_raw_body_before_dispatch() {
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        assert_raw_request_lifetime(
+            path,
+            json!({
+                "model": "claude-opus-5[1m]",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            "claude-opus-5",
+            AliasProvider::Codex,
+            FakeProvider {
+                name: "codex",
+                models: vec!["gpt-5.5".to_string()],
+            },
+            None,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn non_codex_dispatch_preserves_raw_body_headers_and_query() {
+    for (provider_name, alias_provider, model, normalized_model) in [
+        (
+            "anthropic",
+            AliasProvider::Anthropic,
+            "claude-opus-5[1m]",
+            "claude-opus-5",
+        ),
+        ("kimi", AliasProvider::Kimi, "kimi-k2.6[1m]", "kimi-k2.6"),
+        ("grok", AliasProvider::Anthropic, "grok-4.5", "grok-4.5"),
+        (
+            "cursor",
+            AliasProvider::Anthropic,
+            "cursor:gpt-5.5",
+            "cursor:gpt-5.5",
+        ),
+    ] {
+        for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+            assert_raw_request_lifetime(
+                path,
+                json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "原文\n保持"}],
+                    "client_extension": {"preserve": true}
+                }),
+                normalized_model,
+                alias_provider,
+                FakeProvider {
+                    name: provider_name,
+                    models: vec![normalized_model.to_string()],
+                },
+                None,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn auto_review_codex_dispatch_releases_raw_body() {
+    assert_raw_request_lifetime(
+        "/v1/messages",
+        json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "review"}],
+            "system": [{
+                "type": "text",
+                "text": "You are a security monitor for autonomous AI coding agents. Review this turn."
+            }]
+        }),
+        "gpt-5.6-luna",
+        AliasProvider::Codex,
+        FakeProvider {
+            name: "codex",
+            models: vec!["gpt-5.5".to_string(), "gpt-5.6-luna".to_string()],
+        },
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn auto_review_non_codex_dispatch_preserves_raw_request() {
+    assert_raw_request_lifetime(
+        "/v1/messages",
+        json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "review"}],
+            "system": [{
+                "type": "text",
+                "text": "You are a security monitor for autonomous AI coding agents. Review this turn."
+            }]
+        }),
+        "gpt-5.6-luna",
+        AliasProvider::Codex,
+        FakeProvider {
+            name: "kimi",
+            models: vec!["gpt-5.6-luna".to_string()],
+        },
+        Some(FakeProvider {
+            name: "codex",
+            models: vec!["gpt-5.5".to_string()],
+        }),
+    )
+    .await;
 }
 
 #[tokio::test]

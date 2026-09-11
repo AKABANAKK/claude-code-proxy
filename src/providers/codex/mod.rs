@@ -50,7 +50,7 @@ use self::translate::model_allowlist::{
     assert_allowed_model, full_lane_web_search_model, resolve_model_request_with_config_override,
     uses_responses_lite,
 };
-use self::translate::reducer::finish_metadata_from_upstream;
+use self::translate::reducer::{FinishMetadata, finish_metadata_from_upstream};
 use self::translate::request::{
     TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
 };
@@ -850,12 +850,15 @@ async fn live_stream_response_once(
     compaction: LiveStreamCompaction,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
+    let collect_finish_metadata = (request_continuation.owner().is_some()
+        && request_continuation.turn_id().is_some())
+        || compaction.attempt.is_some();
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
         message_id,
         model.to_string(),
         estimated_input_tokens,
-    );
-    let mut upstream_sse_body = Vec::new();
+    )
+    .with_finish_metadata(collect_finish_metadata);
     // Keep protocol framing private until real output makes a transparent retry unsafe.
     // Every branch that consumes pending_chunk returns, so it is never flushed twice.
     let mut pending_chunk = Vec::new();
@@ -882,7 +885,6 @@ async fn live_stream_response_once(
             }
             generation_started = true;
         }
-        append_upstream_sse_payload(&mut upstream_sse_body, &payload);
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, None)
         {
             Ok(result) => result,
@@ -925,12 +927,12 @@ async fn live_stream_response_once(
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
             record_live_stream_progress(&ctx, &pending_chunk);
             if terminal {
-                update_continuation_from_upstream(
+                update_continuation_from_metadata(
                     ctx.session_id.as_deref(),
                     &request_continuation,
                     compaction.attempt,
                     &request_body,
-                    &upstream_sse_body,
+                    translator.take_finish_metadata(),
                     upstream_events.socket_id(),
                     compaction.compact_boundary,
                 );
@@ -943,17 +945,16 @@ async fn live_stream_response_once(
                 ctx,
                 request_continuation,
                 request_body,
-                upstream_sse_body,
                 compaction,
             ));
         }
         if terminal {
-            update_continuation_from_upstream(
+            update_continuation_from_metadata(
                 ctx.session_id.as_deref(),
                 &request_continuation,
                 compaction.attempt,
                 &request_body,
-                &upstream_sse_body,
+                translator.take_finish_metadata(),
                 upstream_events.socket_id(),
                 compaction.compact_boundary,
             );
@@ -1046,7 +1047,6 @@ fn empty_live_stream_response() -> Response {
     event_stream_response(futures_util::stream::empty::<Result<Bytes, std::io::Error>>())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn remaining_live_stream_response(
     mut upstream_events: websocket::CodexWebSocketEventStream,
     mut translator: LiveStreamTranslator,
@@ -1054,7 +1054,6 @@ fn remaining_live_stream_response(
     ctx: RequestContext,
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
-    mut upstream_sse_body: Vec<u8>,
     compaction: LiveStreamCompaction,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
@@ -1103,7 +1102,6 @@ fn remaining_live_stream_response(
             };
             match item {
                 Ok(payload) => {
-                    append_upstream_sse_payload(&mut upstream_sse_body, &payload);
                     let (chunk, terminal) = match translate_live_stream_payload(
                         &mut translator,
                         &payload,
@@ -1147,12 +1145,12 @@ fn remaining_live_stream_response(
                         }
                     }
                     if terminal {
-                        update_continuation_from_upstream(
+                        update_continuation_from_metadata(
                             ctx.session_id.as_deref(),
                             &request_continuation,
                             compaction.attempt,
                             &request_body,
-                            &upstream_sse_body,
+                            translator.take_finish_metadata(),
                             upstream_events.socket_id(),
                             compaction.compact_boundary,
                         );
@@ -1215,16 +1213,6 @@ fn remaining_live_stream_response(
         rx.recv().await.map(|item| (item, rx))
     });
     event_stream_response(stream)
-}
-
-fn append_upstream_sse_payload(buffer: &mut Vec<u8>, payload: &serde_json::Value) {
-    let text = payload.to_string();
-    for line in text.lines() {
-        buffer.extend_from_slice(b"data: ");
-        buffer.extend_from_slice(line.as_bytes());
-        buffer.push(b'\n');
-    }
-    buffer.push(b'\n');
 }
 
 fn event_stream_response<S>(stream: S) -> Response
@@ -1373,8 +1361,29 @@ fn update_continuation_from_upstream(
     socket_id: Option<u64>,
     compact_boundary: bool,
 ) {
-    match finish_metadata_from_upstream(upstream_body) {
-        Ok(Some(finish)) if finish.continuation_eligible => {
+    let finish = finish_metadata_from_upstream(upstream_body).ok().flatten();
+    update_continuation_from_metadata(
+        session_id,
+        continuation,
+        compaction_attempt,
+        request_body,
+        finish,
+        socket_id,
+        compact_boundary,
+    );
+}
+
+fn update_continuation_from_metadata(
+    session_id: Option<&str>,
+    continuation: &ContinuationReservation,
+    compaction_attempt: Option<CompactionAttempt>,
+    request_body: &translate::request::ResponsesRequest,
+    finish: Option<FinishMetadata>,
+    socket_id: Option<u64>,
+    compact_boundary: bool,
+) {
+    match finish {
+        Some(finish) if finish.continuation_eligible => {
             if compact_boundary {
                 activate_compaction(
                     session_id,
@@ -1968,6 +1977,82 @@ mod tests {
         while let Some(frame) = body.frame().await {
             frame.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn live_compaction_uses_metadata_without_continuation_or_socket() {
+        let session_id = "live-compaction-finish-metadata";
+        let portable_summary = "Portable summary retaining the context needed for the next turn.";
+        let request = live_test_request("compact this conversation");
+        let native_history = live_test_request("native history").input;
+        let attempt = begin_compaction(session_id, &request.model);
+        assert!(store_compaction(
+            session_id,
+            attempt,
+            native_history.clone()
+        ));
+        let events = [
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message", "id": "summary-message"}
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": portable_summary
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message"}
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "summary-response", "usage": {}}
+            }),
+        ];
+        let (sender, receiver) = tokio::sync::mpsc::channel(events.len());
+        for event in events {
+            sender.send(Ok(event)).await.unwrap();
+        }
+        drop(sender);
+        let (upstream, _) = websocket::CodexWebSocketEventStream::pending(receiver);
+        assert!(upstream.socket_id().is_none());
+        let response = match live_stream_response_once(
+            upstream,
+            "summary-message".to_string(),
+            &request.model,
+            live_test_context(session_id),
+            ContinuationReservation::for_owner_turn(None, None),
+            request.clone(),
+            LiveStreamCompaction {
+                compact_boundary: true,
+                attempt: Some(attempt),
+            },
+        )
+        .await
+        {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { error, .. } => panic!("予期しない再試行: {error}"),
+        };
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains(portable_summary));
+
+        let mut next_request = live_test_request(portable_summary);
+        let follow_up = live_test_request("follow up").input;
+        next_request.input.extend(follow_up.clone());
+        let replay = apply_compaction_replay(Some(session_id), &next_request)
+            .expect("継続reservationとsocketがなくてもcompactionを有効化する");
+        let expected: Vec<_> = native_history.into_iter().chain(follow_up).collect();
+        assert_eq!(
+            serde_json::to_value(replay.request.input).unwrap(),
+            serde_json::to_value(expected).unwrap(),
+        );
+        assert!(replay.attempt == attempt);
+        abort_compaction_attempt(Some(session_id), Some(attempt));
     }
 
     #[test]
