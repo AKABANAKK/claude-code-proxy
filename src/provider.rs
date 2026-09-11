@@ -123,9 +123,9 @@ pub struct RequestContext {
     pub provider: String,
     pub traffic: Option<Arc<TrafficCapture>>,
     pub monitor: Option<MonitorHandle>,
-    /// Raw request material for byte-passthrough providers (the Anthropic backend).
-    /// Present on real HTTP requests; None in unit tests. Forwarding these verbatim
-    /// keeps the prompt-cache prefix byte-identical.
+    /// Messagesとcount_tokensのHTTP配送では、最終ProviderがCodex以外の場合だけ原文転送用の素材を保持する。
+    /// Codexへの配送や原文を伴わない呼び出しではNoneになる。
+    /// 原文をそのまま転送し、プロンプトキャッシュのプレフィックスをバイト単位で維持する。
     pub passthrough: Option<Passthrough>,
 }
 

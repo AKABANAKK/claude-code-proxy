@@ -1724,14 +1724,19 @@ async fn dispatch_request(
         provider: provider.name().to_string(),
         traffic,
         monitor: state.monitor.clone(),
-        passthrough: Some(crate::provider::Passthrough {
-            raw_body: body_bytes,
-            headers,
-            path_and_query: uri
-                .path_and_query()
-                .map(|pq| pq.as_str().to_string())
-                .unwrap_or_else(|| path.clone()),
-        }),
+        passthrough: if provider.name() == "codex" {
+            drop(body_bytes);
+            None
+        } else {
+            Some(crate::provider::Passthrough {
+                raw_body: body_bytes,
+                headers,
+                path_and_query: uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string())
+                    .unwrap_or_else(|| path.clone()),
+            })
+        },
     };
 
     let response = if count_tokens {

@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::anthropic::sse::encode_sse_event;
 use crate::providers::codex::events::{
-    classify_event_failure, is_standard_max_output_tokens_incomplete,
+    classify_event_failure, event_is_success_terminal, is_standard_max_output_tokens_incomplete,
+    response_is_incomplete_terminal,
 };
 use crate::traffic::TrafficCapture;
 
@@ -10,11 +11,12 @@ use super::IncompleteResponsePolicy;
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
-    CodexUsage, STOP_END_TURN, STOP_MAX_TOKENS, STOP_TOOL_USE, map_codex_usage_to_anthropic,
+    BUFFERED_TOOL_MAX_ARGS_BYTES, CodexUsage, FinishMetadata, STOP_END_TURN, STOP_MAX_TOKENS,
+    STOP_TOOL_USE, map_codex_usage_to_anthropic, reasoning_input_item,
 };
+use super::request::{ResponsesContentPart, ResponsesInputItem};
 
 const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
-const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
 
 enum LiveBlock {
     Text {
@@ -52,6 +54,16 @@ struct LiveThinking {
     anthropic_index: usize,
 }
 
+#[derive(Default)]
+struct LiveFinishMetadata {
+    output_items: BTreeMap<usize, ResponsesInputItem>,
+    open_blocks: HashSet<usize>,
+    text_overrides: HashMap<usize, String>,
+    response_id: Option<String>,
+    continuation_eligible: bool,
+    finished: bool,
+}
+
 pub struct LiveStreamTranslator {
     message_id: String,
     model: String,
@@ -71,6 +83,7 @@ pub struct LiveStreamTranslator {
     // authoritative usage in the terminal message_delta.
     estimated_input_tokens: u64,
     incomplete_response_policy: IncompleteResponsePolicy,
+    finish_metadata: Option<Box<LiveFinishMetadata>>,
     finished: bool,
 }
 
@@ -101,6 +114,7 @@ impl LiveStreamTranslator {
             semantic_output_started: false,
             estimated_input_tokens,
             incomplete_response_policy: IncompleteResponsePolicy::Error,
+            finish_metadata: None,
             finished: false,
         }
     }
@@ -111,6 +125,24 @@ impl LiveStreamTranslator {
     ) -> Self {
         self.incomplete_response_policy = policy;
         self
+    }
+
+    pub(crate) fn with_finish_metadata(mut self, enabled: bool) -> Self {
+        self.finish_metadata = enabled.then(Box::default);
+        self
+    }
+
+    pub(crate) fn take_finish_metadata(&mut self) -> Option<FinishMetadata> {
+        let metadata = self.finish_metadata.take()?;
+        if metadata.finished {
+            Some(FinishMetadata {
+                continuation_eligible: metadata.continuation_eligible,
+                response_id: metadata.response_id,
+                output_items: metadata.output_items.into_values().collect(),
+            })
+        } else {
+            None
+        }
     }
 
     pub fn accept(
@@ -129,6 +161,7 @@ impl LiveStreamTranslator {
             == IncompleteResponsePolicy::AllowMaxOutputTokens
             && is_standard_max_output_tokens_incomplete(payload);
         if !allowed_incomplete && let Some(failure) = classify_event_failure(payload) {
+            self.finish_metadata = None;
             return Err(failure.message);
         }
 
@@ -214,6 +247,7 @@ impl LiveStreamTranslator {
         if self.finished || !self.saw_tool_use || !self.blocks_by_output_index.is_empty() {
             return out;
         }
+        self.finish_metadata = None;
         self.close_thinking(traffic, &mut out);
         self.ensure_message_start(traffic, &mut out);
         self.emit_finish(STOP_TOOL_USE, None, traffic, &mut out);
@@ -230,6 +264,7 @@ impl LiveStreamTranslator {
         if self.finished {
             return out;
         }
+        self.finish_metadata = None;
         self.close_open_blocks(traffic, &mut out);
         self.ensure_message_start(traffic, &mut out);
         self.emit(
@@ -311,6 +346,12 @@ impl LiveStreamTranslator {
         };
         let output_index = output_index(payload);
         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(metadata) = self.finish_metadata.as_mut()
+            && matches!(item_type, "message" | "function_call")
+        {
+            metadata.open_blocks.insert(output_index);
+            metadata.text_overrides.remove(&output_index);
+        }
 
         match item_type {
             "reasoning" => {
@@ -462,7 +503,7 @@ impl LiveStreamTranslator {
         }
         self.semantic_output_started = true;
 
-        let output_index = payload
+        let addressed_output_index = payload
             .get("output_index")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
@@ -471,8 +512,8 @@ impl LiveStreamTranslator {
                     .get("item_id")
                     .and_then(|v| v.as_str())
                     .and_then(|id| self.item_id_to_output_index.get(id).copied())
-            })
-            .unwrap_or(0);
+            });
+        let output_index = addressed_output_index.unwrap_or(0);
 
         if !self.blocks_by_output_index.contains_key(&output_index) {
             let index = self.anthropic_index;
@@ -509,6 +550,20 @@ impl LiveStreamTranslator {
         else {
             return;
         };
+        if let Some(metadata) = self.finish_metadata.as_mut()
+            && metadata.open_blocks.contains(&output_index)
+        {
+            if addressed_output_index.is_some() {
+                if let Some(captured_text) = metadata.text_overrides.get_mut(&output_index) {
+                    captured_text.push_str(delta);
+                }
+            } else {
+                metadata
+                    .text_overrides
+                    .entry(output_index)
+                    .or_insert_with(|| text.clone());
+            }
+        }
         text.push_str(delta);
         if *deferred {
             return;
@@ -560,6 +615,9 @@ impl LiveStreamTranslator {
         };
         args_accum.push_str(delta);
         *had_delta = true;
+        if args_accum.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
+            self.finish_metadata = None;
+        }
         if *buffer_until_done {
             if args_accum.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
                 return Err(format!(
@@ -593,7 +651,18 @@ impl LiveStreamTranslator {
             return Ok(());
         }
         if let Some((index, repaired)) = repaired_read {
-            self.blocks_by_output_index.remove(&output_index);
+            if let Some(LiveBlock::Tool {
+                call_id,
+                name,
+                args_accum,
+                ..
+            }) = self.blocks_by_output_index.remove(&output_index)
+            {
+                self.capture_tool_output(output_index, call_id, name, args_accum);
+            }
+            if let Some(metadata) = self.finish_metadata.as_mut() {
+                metadata.finished = true;
+            }
             self.semantic_output_started = true;
             self.emit(
                 traffic,
@@ -641,6 +710,27 @@ impl LiveStreamTranslator {
         };
         if args_accum.is_empty() {
             *args_accum = args.to_string();
+        }
+    }
+
+    fn capture_tool_output(
+        &mut self,
+        output_index: usize,
+        call_id: String,
+        name: String,
+        arguments: String,
+    ) {
+        if let Some(metadata) = self.finish_metadata.as_mut()
+            && metadata.open_blocks.remove(&output_index)
+        {
+            metadata.output_items.insert(
+                output_index,
+                ResponsesInputItem::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                },
+            );
         }
     }
 
@@ -705,6 +795,31 @@ impl LiveStreamTranslator {
                 text,
                 deferred,
             } => {
+                if let Some(metadata) = self.finish_metadata.as_mut()
+                    && metadata.open_blocks.remove(&output_index)
+                {
+                    let captured_text = metadata
+                        .text_overrides
+                        .remove(&output_index)
+                        .unwrap_or_else(|| {
+                            if *deferred {
+                                text.clone()
+                            } else {
+                                std::mem::take(text)
+                            }
+                        });
+                    if !captured_text.is_empty() {
+                        metadata.output_items.insert(
+                            output_index,
+                            ResponsesInputItem::Message {
+                                role: "assistant".to_string(),
+                                content: vec![ResponsesContentPart::OutputText {
+                                    text: captured_text,
+                                }],
+                            },
+                        );
+                    }
+                }
                 if *deferred {
                     self.deferred_text.push((*index, std::mem::take(text)));
                 } else {
@@ -730,11 +845,24 @@ impl LiveStreamTranslator {
                 ..
             } => {
                 self.semantic_output_started = true;
-                if let Some(final_args) = payload
+                let final_args = payload
                     .get("item")
                     .and_then(|item| item.get("arguments"))
                     .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| !s.is_empty());
+                let metadata_arguments = if self.finish_metadata.is_some()
+                    && (payload.get("item").is_none()
+                        || (!*had_delta
+                            && !*emitted_args
+                            && !args_accum.is_empty()
+                            && final_args
+                                .is_some_and(|arguments| arguments != args_accum.as_str())))
+                {
+                    Some(args_accum.clone())
+                } else {
+                    None
+                };
+                if let Some(final_args) = final_args
                     && (args_accum.is_empty() || (!*had_delta && !*emitted_args))
                 {
                     *args_accum = final_args.to_string();
@@ -766,6 +894,19 @@ impl LiveStreamTranslator {
                         "type": "content_block_stop",
                         "index": index,
                     }),
+                );
+                let arguments = match metadata_arguments {
+                    Some(arguments) if payload.get("item").is_some() => {
+                        sanitize_read_args(name, &arguments, Some(call_id.as_str()))
+                    }
+                    Some(arguments) => arguments,
+                    None => std::mem::take(args_accum),
+                };
+                self.capture_tool_output(
+                    output_index,
+                    std::mem::take(call_id),
+                    std::mem::take(name),
+                    arguments,
                 );
             }
         }
@@ -908,6 +1049,20 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) {
+        if let Some(metadata) = self.finish_metadata.as_mut() {
+            if metadata.open_blocks.is_empty() {
+                metadata.finished = true;
+                metadata.continuation_eligible =
+                    event_is_success_terminal(payload) && !response_is_incomplete_terminal(payload);
+                metadata.response_id = payload
+                    .get("response")
+                    .and_then(|response| response.get("id"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+            } else {
+                self.finish_metadata = None;
+            }
+        }
         self.close_thinking(traffic, out);
         self.close_open_blocks(traffic, out);
         self.emit_web_searches(traffic, out);
@@ -1036,17 +1191,22 @@ impl LiveStreamTranslator {
                 "index": index,
             }),
         );
+        if let Some(metadata) = self.finish_metadata.as_mut() {
+            metadata
+                .output_items
+                .insert(output_index, reasoning_input_item(replay));
+        }
     }
 
     fn close_thinking(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
         let Some(thinking) = self.thinking.take() else {
             return;
         };
-        if let Some(signature) = self
+        if let Some(replay) = self
             .reasoning_by_output_index
             .remove(&thinking.output_index)
             .and_then(|pending| pending.replay())
-            .and_then(|replay| encode_reasoning_signature(&replay))
+            && let Some(signature) = encode_reasoning_signature(&replay)
         {
             self.emit(
                 traffic,
@@ -1058,6 +1218,11 @@ impl LiveStreamTranslator {
                     "delta": {"type": "signature_delta", "signature": signature}
                 }),
             );
+            if let Some(metadata) = self.finish_metadata.as_mut() {
+                metadata
+                    .output_items
+                    .insert(thinking.output_index, reasoning_input_item(replay));
+            }
         }
         self.emit(
             traffic,
@@ -1195,6 +1360,329 @@ mod tests {
             out.extend(translator.accept(&event, None).unwrap());
         }
         String::from_utf8(out).unwrap()
+    }
+
+    fn assert_finish_metadata_matches_reducer(
+        events: Vec<serde_json::Value>,
+    ) -> Option<FinishMetadata> {
+        let mut ordinary = LiveStreamTranslator::new("msg_metadata", "gpt-5.5");
+        let mut collecting =
+            LiveStreamTranslator::new("msg_metadata", "gpt-5.5").with_finish_metadata(true);
+        let mut upstream = Vec::new();
+        for event in events {
+            upstream.extend_from_slice(format!("data: {event}\n\n").as_bytes());
+            let ordinary_chunk = ordinary.accept(&event, None);
+            let collected_chunk = collecting.accept(&event, None);
+            assert_eq!(collected_chunk, ordinary_chunk);
+            if collected_chunk.is_err() || collecting.is_finished() {
+                break;
+            }
+        }
+        let expected = super::super::reducer::finish_metadata_from_upstream(&upstream)
+            .ok()
+            .flatten();
+        let actual = collecting.take_finish_metadata();
+        assert!(collecting.finish_metadata.is_none());
+        assert!(collecting.take_finish_metadata().is_none());
+        assert_eq!(
+            actual
+                .as_ref()
+                .map(|metadata| metadata.continuation_eligible),
+            expected
+                .as_ref()
+                .map(|metadata| metadata.continuation_eligible),
+        );
+        assert_eq!(
+            actual
+                .as_ref()
+                .and_then(|metadata| metadata.response_id.as_deref()),
+            expected
+                .as_ref()
+                .and_then(|metadata| metadata.response_id.as_deref()),
+        );
+        assert_eq!(
+            actual
+                .as_ref()
+                .map(|metadata| serde_json::to_value(&metadata.output_items).unwrap()),
+            expected
+                .as_ref()
+                .map(|metadata| serde_json::to_value(&metadata.output_items).unwrap()),
+        );
+        actual
+    }
+
+    fn text_stream_events(text: &str) -> Vec<serde_json::Value> {
+        vec![
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message", "id": "metadata-message"}
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": text
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message"}
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"id": "metadata-response", "usage": {"input_tokens": 7, "output_tokens": 3}}
+            }),
+        ]
+    }
+
+    fn tool_stream_events(name: &str, arguments: &str) -> Vec<serde_json::Value> {
+        vec![
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "metadata-tool", "name": name}
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": arguments
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "function_call", "arguments": arguments}
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"id": "metadata-response", "usage": {}}
+            }),
+        ]
+    }
+
+    #[test]
+    fn finish_metadata_matches_text_and_tool_outputs() {
+        for text in ["answer", "", "日本語\n記号：é"] {
+            let metadata = assert_finish_metadata_matches_reducer(text_stream_events(text))
+                .expect("正常完了の終了情報を保持する");
+            assert!(metadata.continuation_eligible);
+        }
+        for (name, arguments) in [
+            ("Bash", "{ \"command\": \"pwd\" }"),
+            (
+                "Read",
+                r#"{"file_path":"/tmp/metadata","offset":2,"pages":""}"#,
+            ),
+        ] {
+            let metadata =
+                assert_finish_metadata_matches_reducer(tool_stream_events(name, arguments))
+                    .expect("ツールの終了情報を保持する");
+            assert!(metadata.continuation_eligible);
+        }
+    }
+
+    #[test]
+    fn finish_metadata_preserves_reasoning_replay_with_and_without_summary() {
+        for summary in [None, Some("plan")] {
+            let mut events = vec![json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "metadata-reasoning", "encrypted_content": "opaque"}
+            })];
+            if let Some(summary) = summary {
+                events.push(json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": 0,
+                    "delta": summary
+                }));
+            }
+            events.extend([
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {"type": "reasoning", "id": "metadata-reasoning"}
+                }),
+                json!({"type": "response.done", "response": {"id": "metadata-response"}}),
+            ]);
+            let metadata = assert_finish_metadata_matches_reducer(events).unwrap();
+            assert!(matches!(
+                metadata.output_items.as_slice(),
+                [ResponsesInputItem::Reasoning { id, encrypted_content, .. }]
+                    if id == "metadata-reasoning" && encrypted_content == "opaque"
+            ));
+        }
+    }
+
+    #[test]
+    fn finish_metadata_orders_outputs_by_upstream_index() {
+        let mut events = Vec::new();
+        for (output_index, text) in [(1, "second"), (0, "first")] {
+            for mut event in text_stream_events(text).into_iter().take(3) {
+                event["output_index"] = json!(output_index);
+                events.push(event);
+            }
+        }
+        events.push(json!({
+            "type": "response.completed",
+            "response": {"id": "metadata-response"}
+        }));
+        let metadata = assert_finish_metadata_matches_reducer(events).unwrap();
+        let items = serde_json::to_value(metadata.output_items).unwrap();
+        assert_eq!(items[0]["content"][0]["text"], "first");
+        assert_eq!(items[1]["content"][0]["text"], "second");
+    }
+
+    #[test]
+    fn finish_metadata_preserves_deferred_web_search_text() {
+        let mut events = vec![
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "web_search_call", "id": "metadata-search"}
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "web_search_call", "id": "metadata-search", "action": {"query": "query"}}
+            }),
+        ];
+        for mut event in text_stream_events("answer") {
+            if event.get("output_index").is_some() {
+                event["output_index"] = json!(1);
+            }
+            events.push(event);
+        }
+        let metadata = assert_finish_metadata_matches_reducer(events).unwrap();
+        assert_eq!(metadata.output_items.len(), 1);
+    }
+
+    #[test]
+    fn finish_metadata_ignores_text_without_reducer_addressing() {
+        let mut events = text_stream_events("untracked");
+        events.remove(0);
+        let metadata = assert_finish_metadata_matches_reducer(events).unwrap();
+        assert!(metadata.output_items.is_empty());
+
+        let mut events = text_stream_events("untracked");
+        events.remove(2);
+        events.remove(0);
+        let metadata = assert_finish_metadata_matches_reducer(events).unwrap();
+        assert!(metadata.output_items.is_empty());
+
+        let mut events = text_stream_events("kept");
+        events.insert(
+            2,
+            json!({"type": "response.output_text.delta", "delta": " ignored"}),
+        );
+        events.insert(
+            3,
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "metadata-message",
+                "delta": " appended"
+            }),
+        );
+        let metadata = assert_finish_metadata_matches_reducer(events).unwrap();
+        let items = serde_json::to_value(metadata.output_items).unwrap();
+        assert_eq!(items[0]["content"][0]["text"], "kept appended");
+    }
+
+    #[test]
+    fn finish_metadata_preserves_done_argument_precedence() {
+        for (name, earlier, later) in [
+            ("Bash", r#"{ "value": 1 }"#, r#"{"value":2}"#),
+            (
+                "Read",
+                r#"{"file_path":"/tmp/first","offset":2,"pages":""}"#,
+                r#"{"file_path":"/tmp/second","offset":3,"pages":""}"#,
+            ),
+        ] {
+            let mut events = tool_stream_events(name, later);
+            events[1] = json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": earlier
+            });
+            assert_finish_metadata_matches_reducer(events).unwrap();
+        }
+
+        let mut events = tool_stream_events("Bash", r#"{"command":"pwd"}"#);
+        events.remove(1);
+        assert_finish_metadata_matches_reducer(events).unwrap();
+    }
+
+    #[test]
+    fn finish_metadata_preserves_unsanitized_arguments_when_done_omits_item() {
+        let mut events = tool_stream_events(
+            "Read",
+            r#"{"file_path":"/tmp/metadata","offset":2,"pages":""}"#,
+        );
+        events[2].as_object_mut().unwrap().remove("item");
+        assert_finish_metadata_matches_reducer(events).unwrap();
+    }
+
+    #[test]
+    fn finish_metadata_rejects_incomplete_or_unclosed_streams() {
+        let mut events = text_stream_events("open");
+        events.remove(2);
+        assert!(assert_finish_metadata_matches_reducer(events).is_none());
+
+        let mut events = text_stream_events("unfinished");
+        events.pop();
+        assert!(assert_finish_metadata_matches_reducer(events).is_none());
+
+        for terminal in [
+            json!({"type": "response.failed", "response": {"error": {"message": "failed"}}}),
+            json!({"type": "response.incomplete", "response": {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}}),
+        ] {
+            let mut events = text_stream_events("partial");
+            events[3] = terminal;
+            assert!(assert_finish_metadata_matches_reducer(events).is_none());
+        }
+    }
+
+    #[test]
+    fn finish_metadata_marks_repaired_read_completion_ineligible() {
+        let events = tool_stream_events(
+            "Read",
+            &format!(
+                "{{\"file_path\":\"/tmp/metadata\",\"pages\":\"\"{}",
+                " ".repeat(BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES)
+            ),
+        );
+        let metadata = assert_finish_metadata_matches_reducer(events).unwrap();
+        assert!(!metadata.continuation_eligible);
+    }
+
+    #[test]
+    fn finish_metadata_keeps_the_reducer_tool_argument_limit() {
+        for length in [
+            BUFFERED_TOOL_MAX_ARGS_BYTES,
+            BUFFERED_TOOL_MAX_ARGS_BYTES + 1,
+        ] {
+            let metadata = assert_finish_metadata_matches_reducer(tool_stream_events(
+                "Bash",
+                &"x".repeat(length),
+            ));
+            assert_eq!(metadata.is_some(), length == BUFFERED_TOOL_MAX_ARGS_BYTES);
+        }
+    }
+
+    #[test]
+    fn disabled_finish_metadata_does_not_keep_completed_outputs() {
+        let mut translator = LiveStreamTranslator::new("msg_metadata", "gpt-5.5")
+            .with_finish_metadata(true)
+            .with_finish_metadata(false);
+        for output_index in 0..128 {
+            for mut event in text_stream_events("answer").into_iter().take(3) {
+                event["output_index"] = json!(output_index);
+                translator.accept(&event, None).unwrap();
+                assert!(translator.finish_metadata.is_none());
+            }
+        }
+        translator
+            .accept(&json!({"type": "response.completed", "response": {}}), None)
+            .unwrap();
+        assert!(translator.take_finish_metadata().is_none());
     }
 
     #[test]
