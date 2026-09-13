@@ -3,6 +3,10 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- Grok streams show estimated input usage from the start and exact usage at completion, so Claude Code's status bar no longer stays at zero input tokens.
+
 ## v0.1.39 (2026-09-10)
 
 - OpenCode Go users can select 14 additional models, including Grok 4.6, GLM 5.3,
