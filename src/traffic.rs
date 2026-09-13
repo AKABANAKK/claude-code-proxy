@@ -369,6 +369,11 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
                     // Anthropic image blocks carry raw base64 under
                     // `source.data`; redact it for the same reason.
                     out.insert(key.clone(), redact_traffic_value(value));
+                } else if normalized == "encrypted_content" {
+                    // Codex `compaction` and `reasoning` items carry an opaque
+                    // blob that replays a whole conversation's context; it is
+                    // bulk payload, not debug signal, so only its size stays.
+                    out.insert(key.clone(), redact_traffic_value(value));
                 } else if REDACT_KEYS.contains(&normalized.as_str())
                     || matches!(
                         normalized.as_str(),
@@ -524,6 +529,46 @@ mod tests {
         assert!(rendered.contains("redacted"));
         // Structure is preserved.
         assert!(rendered.contains("image/png"));
+    }
+
+    #[test]
+    fn redact_traffic_strips_compaction_encrypted_content() {
+        // Server-side compaction replays the transcript as an opaque blob in
+        // the upstream request; it must not persist, but its size should.
+        let value = serde_json::json!({
+            "model": "gpt-5",
+            "input": [
+                {"type": "compaction", "encrypted_content": "gAAAAABopaque-compacted-transcript"},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "hello"}
+                ]}
+            ]
+        });
+        let redacted = redact_traffic(&value);
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("gAAAAA"),
+            "encrypted_content leaked: {rendered}"
+        );
+        assert_eq!(
+            redacted["input"][0]["encrypted_content"],
+            "[redacted len=34]"
+        );
+        assert_eq!(redacted["input"][0]["type"], "compaction");
+        assert_eq!(redacted["input"][1]["content"][0]["text"], "hello");
+        assert_eq!(redacted["model"], "gpt-5");
+    }
+
+    #[test]
+    fn redact_traffic_strips_reasoning_encrypted_content_in_events() {
+        // Upstream response items carry the same blob under `reasoning`.
+        let value = serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "gAAAAAopaque"}
+        });
+        let redacted = redact_traffic(&value);
+        assert_eq!(redacted["item"]["encrypted_content"], "[redacted len=12]");
+        assert_eq!(redacted["item"]["id"], "rs_1");
     }
 
     #[test]
