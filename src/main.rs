@@ -202,11 +202,15 @@ async fn run_service(config: ServerConfig) -> Result<()> {
     tokio::pin!(server);
     tokio::select! {
         result = &mut server => result,
-        _ = signals.recv() => {
+        signal = signals.recv() => {
+            signal?;
             let _ = shutdown.send(());
             tokio::select! {
                 result = &mut server => result,
-                _ = signals.recv() => std::process::exit(130),
+                signal = signals.recv() => {
+                    signal?;
+                    std::process::exit(130);
+                }
             }
         }
     }
@@ -227,25 +231,44 @@ impl ServiceShutdownSignals {
         })
     }
 
-    async fn recv(&mut self) {
+    async fn recv(&mut self) -> std::io::Result<()> {
         tokio::select! {
-            _ = self.interrupt.recv() => {}
-            _ = self.terminate.recv() => {}
+            _ = self.interrupt.recv() => Ok(()),
+            _ = self.terminate.recv() => Ok(()),
         }
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+struct ServiceShutdownSignals {
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+#[cfg(windows)]
+impl ServiceShutdownSignals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            ctrl_c: tokio::signal::windows::ctrl_c()?,
+        })
+    }
+
+    async fn recv(&mut self) -> std::io::Result<()> {
+        let _ = self.ctrl_c.recv().await;
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 struct ServiceShutdownSignals;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl ServiceShutdownSignals {
     fn new() -> std::io::Result<Self> {
         Ok(Self)
     }
 
-    async fn recv(&mut self) {
-        let _ = tokio::signal::ctrl_c().await;
+    async fn recv(&mut self) -> std::io::Result<()> {
+        tokio::signal::ctrl_c().await
     }
 }
 
@@ -393,6 +416,17 @@ mod tests {
         let cli = Cli::try_parse_from(["claude-code-proxy", "demo"]).unwrap();
 
         assert!(matches!(cli.command, Some(Commands::Demo)));
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_setup_and_receive_preserve_io_results() {
+        fn assert_constructor(_: fn() -> std::io::Result<ServiceShutdownSignals>) {}
+        fn assert_io_future<F: std::future::Future<Output = std::io::Result<()>>>(_: &F) {}
+
+        assert_constructor(ServiceShutdownSignals::new);
+        let mut signals = ServiceShutdownSignals::new().unwrap();
+        let receive = signals.recv();
+        assert_io_future(&receive);
     }
 
     #[test]
