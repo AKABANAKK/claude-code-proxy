@@ -91,6 +91,8 @@ async fn snapshot_access_requires_a_real_loopback_peer() {
         (Some("192.0.2.1:1111"), StatusCode::FORBIDDEN),
         (Some("127.0.0.1:1111"), StatusCode::OK),
         (Some("[::1]:1111"), StatusCode::OK),
+        (Some("[::ffff:127.0.0.1]:1111"), StatusCode::OK),
+        (Some("[::ffff:192.0.2.1]:1111"), StatusCode::FORBIDDEN),
     ] {
         let request = Request::get("/monitor").header("x-forwarded-for", "127.0.0.1");
         let request = match peer {

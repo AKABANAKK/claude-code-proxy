@@ -316,7 +316,7 @@ async fn handler_monitor(
             "Monitor access requires a local connection",
         );
     };
-    if !peer.ip().is_loopback() {
+    if !peer.ip().to_canonical().is_loopback() {
         return json_error(
             StatusCode::FORBIDDEN,
             "permission_error",
