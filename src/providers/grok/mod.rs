@@ -389,7 +389,7 @@ where
                 if let Some((input_tokens, output_tokens)) = usage
                     && let Some(monitor) = self.monitor.as_ref()
                 {
-                    monitor.usage_updated(&self.req_id, Some(input_tokens), Some(output_tokens));
+                    monitor.usage_updated(&self.req_id, input_tokens, Some(output_tokens));
                 }
                 if self.reducer.finished() {
                     self.terminal = true;
@@ -688,6 +688,59 @@ mod tests {
         assert_eq!(
             finished.pointer("/usage/output_tokens"),
             Some(&serde_json::json!(3))
+        );
+    }
+
+    /// Streams one estimated response and returns the monitor's published
+    /// input and output usage. `None` means the field was never set.
+    async fn monitored_usage(completed_response: &str) -> (Option<u64>, Option<u64>) {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("req_1", None, Some(1), EndpointKind::Messages);
+        monitor.provider_selected("req_1", "grok", "grok-4.5", None);
+        monitor.request_completed("req_1", 200, None, None);
+        let payload = format!(
+            "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{completed_response}}}\n\n"
+        );
+        let upstream = futures_util::stream::iter(vec![Ok(Bytes::from(payload))]);
+        let response = stream_body(
+            upstream,
+            "msg_1".into(),
+            "grok-4.5".into(),
+            321,
+            Some(monitor.clone()),
+            "req_1".into(),
+            None,
+        );
+        let _ = response.into_body().collect().await.unwrap();
+        let snapshot = monitor.snapshot();
+        let request = snapshot
+            .recent
+            .iter()
+            .find(|request| request.request_id == "req_1")
+            .unwrap();
+        (request.input_tokens, request.output_tokens)
+    }
+
+    #[tokio::test]
+    async fn missing_provider_input_usage_does_not_zero_the_monitor() {
+        assert_eq!(
+            monitored_usage("{\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}").await,
+            (Some(12), Some(3))
+        );
+        // A provider-reported zero is preserved rather than treated as missing.
+        assert_eq!(
+            monitored_usage("{\"usage\":{\"input_tokens\":0,\"output_tokens\":3}}").await,
+            (Some(0), Some(3))
+        );
+        assert_eq!(
+            monitored_usage("{\"usage\":{\"output_tokens\":3}}").await,
+            (None, Some(3))
+        );
+        assert_eq!(monitored_usage("{\"usage\":{}}").await, (None, Some(0)));
+        assert_eq!(monitored_usage("{}").await, (None, Some(0)));
+        assert_eq!(
+            monitored_usage("{\"usage\":{\"input_tokens\":\"12\"}}").await,
+            (None, Some(0))
         );
     }
 
