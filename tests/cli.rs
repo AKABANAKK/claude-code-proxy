@@ -5,7 +5,8 @@ use std::env;
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    process::{Child, Stdio},
+    process::{Child, ExitStatus, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -122,19 +123,14 @@ impl Drop for ChildGuard {
 }
 
 #[cfg(unix)]
-fn plain_service_exits_on_second_signal(signal: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
-        .args(["serve", "--no-monitor", "--port", &port.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut child = ChildGuard(child);
+fn wait_for_service(
+    child: &mut ChildGuard,
+    port: u16,
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut held_connection = loop {
+    loop {
         match TcpStream::connect(("127.0.0.1", port)) {
-            Ok(stream) => break stream,
+            Ok(stream) => return Ok(stream),
             Err(error) if Instant::now() < deadline => {
                 if let Some(status) = child.0.try_wait()? {
                     let mut stderr = String::new();
@@ -148,35 +144,117 @@ fn plain_service_exits_on_second_signal(signal: &str) -> Result<(), Box<dyn std:
             }
             Err(error) => return Err(error.into()),
         }
-    };
-    held_connection.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n")?;
-    thread::sleep(Duration::from_millis(100));
+    }
+}
 
-    assert!(
-        std::process::Command::new("kill")
-            .args([signal, &child.0.id().to_string()])
-            .status()?
-            .success()
-    );
-    thread::sleep(Duration::from_millis(200));
-    assert!(child.0.try_wait()?.is_none());
+#[cfg(unix)]
+fn send_signal(child: &ChildGuard, signal: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let status = std::process::Command::new("kill")
+        .args([signal, &child.0.id().to_string()])
+        .status()?;
+    if !status.success() {
+        return Err(format!("kill {signal} failed with {status}").into());
+    }
+    Ok(())
+}
 
-    assert!(
-        std::process::Command::new("kill")
-            .args([signal, &child.0.id().to_string()])
-            .status()?
-            .success()
-    );
-    let deadline = Instant::now() + Duration::from_secs(4);
+#[cfg(unix)]
+fn wait_for_exit(
+    child: &mut ChildGuard,
+    timeout: Duration,
+) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
     loop {
-        if child.0.try_wait()?.is_some() {
-            return Ok(());
+        if let Some(status) = child.0.try_wait()? {
+            return Ok(status);
         }
         if Instant::now() >= deadline {
             return Err("plain service did not exit after the second signal".into());
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[cfg(unix)]
+fn plain_service_exits_on_second_signal(signal: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
+        .args(["serve", "--no-monitor", "--port", &port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut child = ChildGuard(child);
+    let mut held_connection = wait_for_service(&mut child, port)?;
+    held_connection.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n")?;
+    thread::sleep(Duration::from_millis(100));
+
+    send_signal(&child, signal)?;
+    thread::sleep(Duration::from_millis(200));
+    assert!(child.0.try_wait()?.is_none());
+
+    send_signal(&child, signal)?;
+    assert_eq!(
+        wait_for_exit(&mut child, Duration::from_secs(4))?.code(),
+        Some(130)
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn second_signal_exits_while_kimi_blocking_request_is_running()
+-> Result<(), Box<dyn std::error::Error>> {
+    let upstream = TcpListener::bind("127.0.0.1:0")?;
+    let upstream_url = format!("http://{}", upstream.local_addr()?);
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let fixture = thread::spawn(move || {
+        let (stream, _) = upstream.accept().unwrap();
+        accepted_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+        drop(stream);
+    });
+
+    let config = TempDir::new()?;
+    let auth_dir = config.path().join("kimi");
+    std::fs::create_dir_all(&auth_dir)?;
+    std::fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"access":"test","refresh":"test","expires":4102444800000,"scope":"openid","userId":"test"}"#,
+    )?;
+    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
+        .args(["serve", "--no-monitor", "--port", &port.to_string()])
+        .env("CCP_CONFIG_DIR", config.path())
+        .env("CCP_KIMI_BASE_URL", upstream_url)
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut child = ChildGuard(child);
+    let mut downstream = wait_for_service(&mut child, port)?;
+    let body = br#"{"model":"kimi-for-coding","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}"#;
+    write!(
+        downstream,
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )?;
+    downstream.write_all(body)?;
+    accepted_rx.recv_timeout(Duration::from_secs(10))?;
+
+    send_signal(&child, "-TERM")?;
+    thread::sleep(Duration::from_millis(200));
+    assert!(child.0.try_wait()?.is_none());
+    send_signal(&child, "-TERM")?;
+    let status = wait_for_exit(&mut child, Duration::from_secs(2));
+    let _ = release_tx.send(());
+    fixture.join().unwrap();
+
+    assert_eq!(status?.code(), Some(130));
+    Ok(())
 }
 
 #[cfg(unix)]

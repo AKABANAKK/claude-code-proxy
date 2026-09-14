@@ -208,7 +208,7 @@ async fn run_service(config: ServerConfig) -> Result<()> {
                 result = &mut server => result,
                 signal = service_shutdown_signal() => {
                     signal?;
-                    Ok(())
+                    std::process::exit(130);
                 }
             }
         }
