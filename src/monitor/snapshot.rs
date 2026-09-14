@@ -12,6 +12,10 @@ use std::{
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+fn default_snapshot_at() -> SystemTime {
+    SystemTime::now()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitorResponse {
     pub version: u32,
@@ -66,6 +70,8 @@ impl SnapshotUpdate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorSnapshot {
     pub started_at: SystemTime,
+    #[serde(default = "default_snapshot_at")]
+    pub snapshot_at: SystemTime,
     pub uptime: Duration,
     pub sessions: Vec<SessionSnapshot>,
     pub active: Vec<ActiveSnapshot>,
@@ -76,6 +82,7 @@ impl From<MonitorState> for MonitorSnapshot {
     fn from(state: MonitorState) -> Self {
         Self {
             started_at: state.started_at,
+            snapshot_at: SystemTime::now(),
             uptime: state.uptime,
             sessions: state.sessions.into_iter().map(Into::into).collect(),
             active: state.active.into_iter().map(Into::into).collect(),
@@ -294,10 +301,28 @@ mod tests {
         assert!(!encoded.contains("instant"));
         let decoded: MonitorSnapshot = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, snapshot);
+        assert_eq!(decoded.snapshot_at, snapshot.snapshot_at);
         assert_eq!(decoded.uptime, snapshot.uptime);
         assert_eq!(decoded.active[0].elapsed(), snapshot.active[0].elapsed());
         assert_eq!(decoded.active[0].rate(), snapshot.active[0].rate());
         assert_eq!(decoded.sessions[0].rate(), snapshot.sessions[0].rate());
         assert_eq!(decoded.recent[0].http_status, Some(200));
+    }
+
+    #[test]
+    fn snapshot_deserialization_accepts_legacy_and_newer_fields() {
+        let snapshot: MonitorSnapshot = MonitorHandle::default().snapshot().into();
+        let mut legacy = serde_json::to_value(&snapshot).unwrap();
+        legacy.as_object_mut().unwrap().remove("snapshot_at");
+        let decoded: MonitorSnapshot = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.snapshot_at >= snapshot.started_at);
+
+        let mut newer = serde_json::to_value(&snapshot).unwrap();
+        newer
+            .as_object_mut()
+            .unwrap()
+            .insert("future_field".into(), serde_json::json!(true));
+        let decoded: MonitorSnapshot = serde_json::from_value(newer).unwrap();
+        assert_eq!(decoded.snapshot_at, snapshot.snapshot_at);
     }
 }

@@ -456,6 +456,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
             &state.sessions,
             app.selected,
             app.focus == FocusPane::Sessions,
+            state.snapshot_at,
         ),
     }
     render_active(frame, root[2], &state.active, app.tick);
@@ -751,7 +752,11 @@ fn sparkline_bucket(timestamp: SystemTime) -> u64 {
         / SESSION_TOKEN_BUCKET_SECS
 }
 
-fn token_sparkline(samples: &[(SystemTime, u64)], width: usize, now: SystemTime) -> String {
+fn token_sparkline(
+    samples: &[(SystemTime, u64)],
+    width: usize,
+    reference_at: SystemTime,
+) -> String {
     const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
     if width == 0 {
@@ -765,7 +770,7 @@ fn token_sparkline(samples: &[(SystemTime, u64)], width: usize, now: SystemTime)
         *total = total.saturating_add(*tokens);
     }
 
-    let current_bucket = sparkline_bucket(now);
+    let current_bucket = sparkline_bucket(reference_at);
     let first_bucket = current_bucket.saturating_sub(width.saturating_sub(1) as u64);
     (first_bucket..=current_bucket)
         .map(|bucket| {
@@ -785,9 +790,9 @@ fn token_sparkline(samples: &[(SystemTime, u64)], width: usize, now: SystemTime)
 fn token_sparkline_line(
     samples: &[(SystemTime, u64)],
     width: usize,
-    now: SystemTime,
+    reference_at: SystemTime,
 ) -> Line<'static> {
-    let mut sparkline = token_sparkline(samples, width, now);
+    let mut sparkline = token_sparkline(samples, width, reference_at);
     let current = sparkline
         .pop()
         .map_or_else(String::new, |value| value.to_string());
@@ -904,6 +909,7 @@ fn render_sessions(
     sessions: &[SessionSnapshot],
     selected: usize,
     focused: bool,
+    snapshot_at: SystemTime,
 ) {
     if sessions.is_empty() {
         render_empty_table_state(frame, area, "Sessions", focused, "No sessions");
@@ -914,7 +920,6 @@ fn render_sessions(
     let show_full_sparkline = tier == LayoutTier::Wide && area.width >= SESSION_SPARKLINE_MIN_WIDTH;
     let columns = session_columns(tier, show_full_sparkline);
     let widths = column_constraints(&columns);
-    let now = SystemTime::now();
     let rows = sessions.iter().enumerate().map(|(index, session)| {
         let cells = columns
             .iter()
@@ -955,7 +960,7 @@ fn render_sessions(
                     SessionColumn::Activity => Cell::from(token_sparkline_line(
                         &session.output_token_samples,
                         width,
-                        now,
+                        snapshot_at,
                     )),
                     SessionColumn::Status => status_cell(&session.last_status),
                 }
@@ -2177,6 +2182,68 @@ mod tests {
     }
 
     #[test]
+    fn activity_graph_ignores_positive_viewer_clock_skew() {
+        let snapshot_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let viewer_now = snapshot_at + Duration::from_secs(3_600);
+        let samples = [(snapshot_at, 4_000)];
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "request-1",
+            Some("session-1".into()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.request_completed("request-1", 200, Some(10), Some(4_000));
+        let mut snapshot: MonitorSnapshot = monitor.snapshot().into();
+        snapshot.snapshot_at = snapshot_at;
+        snapshot.sessions[0].output_token_samples = samples.into();
+
+        assert_eq!(token_sparkline(&samples, 4, viewer_now), "    ");
+        let rendered = draw(90, 8, |frame| {
+            render_sessions(
+                frame,
+                frame.area(),
+                &snapshot.sessions,
+                0,
+                true,
+                snapshot.snapshot_at,
+            )
+        });
+        assert!(buffer_text(&rendered).contains('█'));
+    }
+
+    #[test]
+    fn activity_graph_ignores_negative_viewer_clock_skew() {
+        let snapshot_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let viewer_now = snapshot_at - Duration::from_secs(3_600);
+        let samples = [(snapshot_at, 4_000)];
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "request-1",
+            Some("session-1".into()),
+            Some(1),
+            EndpointKind::Messages,
+        );
+        monitor.request_completed("request-1", 200, Some(10), Some(4_000));
+        let mut snapshot: MonitorSnapshot = monitor.snapshot().into();
+        snapshot.snapshot_at = snapshot_at;
+        snapshot.sessions[0].output_token_samples = samples.into();
+
+        assert_eq!(token_sparkline(&samples, 4, viewer_now), "    ");
+        let rendered = draw(90, 8, |frame| {
+            render_sessions(
+                frame,
+                frame.area(),
+                &snapshot.sessions,
+                0,
+                true,
+                snapshot.snapshot_at,
+            )
+        });
+        assert!(buffer_text(&rendered).contains('█'));
+    }
+
+    #[test]
     fn token_sparkline_dims_the_current_bucket() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
         let samples = [
@@ -2209,7 +2276,14 @@ mod tests {
         let state: MonitorSnapshot = monitor.snapshot().into();
         let render_at = |width| {
             let buffer = draw(width, 8, |frame| {
-                render_sessions(frame, frame.area(), &state.sessions, 0, true)
+                render_sessions(
+                    frame,
+                    frame.area(),
+                    &state.sessions,
+                    0,
+                    true,
+                    state.snapshot_at,
+                )
             });
             buffer_text(&buffer)
         };
@@ -2243,7 +2317,7 @@ mod tests {
     #[test]
     fn empty_tables_hide_columns_and_center_placeholders() {
         let sessions = draw(40, 9, |frame| {
-            render_sessions(frame, frame.area(), &[], 0, true)
+            render_sessions(frame, frame.area(), &[], 0, true, SystemTime::now())
         });
         let sessions_text = buffer_text(&sessions);
         assert_centered(&sessions, "No sessions", 4);
@@ -2321,7 +2395,14 @@ mod tests {
         let active_state: MonitorSnapshot = monitor.snapshot().into();
 
         let sessions = draw(170, 8, |frame| {
-            render_sessions(frame, frame.area(), &active_state.sessions, 0, true)
+            render_sessions(
+                frame,
+                frame.area(),
+                &active_state.sessions,
+                0,
+                true,
+                active_state.snapshot_at,
+            )
         });
         let sessions_text = buffer_text(&sessions);
         assert!(sessions_text.contains("Provider"));
@@ -2365,7 +2446,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let session_buffer = draw(120, 6, |frame| {
-            render_sessions(frame, frame.area(), &sessions, 11, true)
+            render_sessions(frame, frame.area(), &sessions, 11, true, state.snapshot_at)
         });
         let session_text = buffer_text(&session_buffer);
         assert!(session_text.contains("row-0011"), "{session_text}");

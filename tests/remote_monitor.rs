@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use axum::{
@@ -187,6 +187,7 @@ async fn wait_until(mut predicate: impl FnMut() -> bool) {
 async fn polling_keeps_last_snapshot_on_failure_and_recovers() {
     let failing = Arc::new(AtomicBool::new(false));
     let requests = Arc::new(AtomicUsize::new(0));
+    let snapshot_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
     let monitor = MonitorHandle::default();
     monitor.request_started("r1", None, None, EndpointKind::Messages);
     let server = serve(Router::new().route(
@@ -198,7 +199,8 @@ async fn polling_keeps_last_snapshot_on_failure_and_recovers() {
             move || {
                 let failed = failing.load(Ordering::SeqCst);
                 requests.fetch_add(1, Ordering::SeqCst);
-                let snapshot = MonitorResponse::from(monitor.snapshot());
+                let mut snapshot = MonitorResponse::from(monitor.snapshot());
+                snapshot.snapshot.snapshot_at = snapshot_at;
                 async move {
                     if failed {
                         StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -213,9 +215,11 @@ async fn polling_keeps_last_snapshot_on_failure_and_recovers() {
     let remote = RemoteMonitor::connect(client(), server.url.clone())
         .await
         .unwrap();
+    assert_eq!(remote.snapshot().snapshot().snapshot_at, snapshot_at);
     failing.store(true, Ordering::SeqCst);
     wait_until(|| remote.snapshot().connection_error().is_some()).await;
     assert_eq!(remote.snapshot().snapshot().active[0].request_id, "r1");
+    assert_eq!(remote.snapshot().snapshot().snapshot_at, snapshot_at);
     monitor.request_completed("r1", 200, Some(10), Some(5));
     failing.store(false, Ordering::SeqCst);
     wait_until(|| {
