@@ -2491,11 +2491,14 @@ mod tests {
             emit_live_event(
                 &mut first_websocket,
                 &serde_json::json!({
-                    "type": "codex.rate_limits",
-                    "rate_limits": {
-                        "allowed": false,
-                        "limit_reached": true,
-                        "primary": {"reset_after_seconds": 0}
+                    "type": "response.failed",
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "status": 429,
+                            "message": "rate limit exceeded",
+                            "retry_after_seconds": 0
+                        }
                     }
                 }),
             )

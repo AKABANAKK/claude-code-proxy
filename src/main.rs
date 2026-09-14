@@ -194,6 +194,7 @@ fn main() -> Result<()> {
 }
 
 async fn run_service(config: ServerConfig) -> Result<()> {
+    let mut signals = ServiceShutdownSignals::new()?;
     let (shutdown, stopped) = tokio::sync::oneshot::channel();
     let server = server::serve_with_shutdown(config, async {
         let _ = stopped.await;
@@ -201,32 +202,51 @@ async fn run_service(config: ServerConfig) -> Result<()> {
     tokio::pin!(server);
     tokio::select! {
         result = &mut server => result,
-        signal = service_shutdown_signal() => {
-            signal?;
+        _ = signals.recv() => {
             let _ = shutdown.send(());
             tokio::select! {
                 result = &mut server => result,
-                signal = service_shutdown_signal() => {
-                    signal?;
-                    std::process::exit(130);
-                }
+                _ = signals.recv() => std::process::exit(130),
             }
         }
     }
 }
 
 #[cfg(unix)]
-async fn service_shutdown_signal() -> std::io::Result<()> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result,
-        _ = terminate.recv() => Ok(()),
+struct ServiceShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ServiceShutdownSignals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
     }
 }
 
 #[cfg(not(unix))]
-async fn service_shutdown_signal() -> std::io::Result<()> {
-    tokio::signal::ctrl_c().await
+struct ServiceShutdownSignals;
+
+#[cfg(not(unix))]
+impl ServiceShutdownSignals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

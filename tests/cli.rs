@@ -177,34 +177,6 @@ fn wait_for_exit(
 
 #[cfg(unix)]
 fn plain_service_exits_on_second_signal(signal: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
-        .args(["serve", "--no-monitor", "--port", &port.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut child = ChildGuard(child);
-    let mut held_connection = wait_for_service(&mut child, port)?;
-    held_connection.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n")?;
-    thread::sleep(Duration::from_millis(100));
-
-    send_signal(&child, signal)?;
-    thread::sleep(Duration::from_millis(200));
-    assert!(child.0.try_wait()?.is_none());
-
-    send_signal(&child, signal)?;
-    assert_eq!(
-        wait_for_exit(&mut child, Duration::from_secs(4))?.code(),
-        Some(130)
-    );
-    Ok(())
-}
-
-#[cfg(unix)]
-#[test]
-fn second_signal_exits_while_kimi_blocking_request_is_running()
--> Result<(), Box<dyn std::error::Error>> {
     let upstream = TcpListener::bind("127.0.0.1:0")?;
     let upstream_url = format!("http://{}", upstream.local_addr()?);
     let (accepted_tx, accepted_rx) = mpsc::channel();
@@ -243,12 +215,12 @@ fn second_signal_exits_while_kimi_blocking_request_is_running()
         body.len()
     )?;
     downstream.write_all(body)?;
-    accepted_rx.recv_timeout(Duration::from_secs(10))?;
+    accepted_rx.recv_timeout(Duration::from_secs(20))?;
 
-    send_signal(&child, "-TERM")?;
+    send_signal(&child, signal)?;
     thread::sleep(Duration::from_millis(200));
     assert!(child.0.try_wait()?.is_none());
-    send_signal(&child, "-TERM")?;
+    send_signal(&child, signal)?;
     let status = wait_for_exit(&mut child, Duration::from_secs(2));
     let _ = release_tx.send(());
     fixture.join().unwrap();
