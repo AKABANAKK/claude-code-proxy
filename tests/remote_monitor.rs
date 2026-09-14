@@ -27,7 +27,7 @@ use claude_code_proxy::{
     server::{AppFeatures, app_with_features},
 };
 use http_body_util::BodyExt;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
 use tower::ServiceExt;
 
 struct Server {
@@ -252,7 +252,23 @@ async fn production_monitor_client_bypasses_outbound_proxy_environment() {
     }
 
     let target_requests = Arc::new(AtomicUsize::new(0));
-    let target = serve(snapshot_app(target_requests.clone())).await;
+    let response_gate = Arc::new(Notify::new());
+    let target = serve(Router::new().route(
+        "/monitor",
+        get({
+            let requests = target_requests.clone();
+            let response_gate = response_gate.clone();
+            move || {
+                requests.fetch_add(1, Ordering::SeqCst);
+                let response_gate = response_gate.clone();
+                async move {
+                    response_gate.notified().await;
+                    Json(MonitorResponse::from(MonitorHandle::default().snapshot()))
+                }
+            }
+        }),
+    ))
+    .await;
     let proxy_requests = Arc::new(AtomicUsize::new(0));
     let proxy = serve(snapshot_app(proxy_requests.clone())).await;
     let mut child = Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
@@ -270,11 +286,11 @@ async fn production_monitor_client_bypasses_outbound_proxy_environment() {
         .unwrap();
 
     wait_until(|| target_requests.load(Ordering::SeqCst) > 0).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(proxy_requests.load(Ordering::SeqCst), 0);
+
     let _ = child.kill();
     let _ = child.wait();
-
-    assert_eq!(proxy_requests.load(Ordering::SeqCst), 0);
+    response_gate.notify_waiters();
 }
 
 #[tokio::test]
