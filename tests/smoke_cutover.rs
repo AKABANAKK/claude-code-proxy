@@ -218,7 +218,10 @@ async fn spawn_auto_fallback_usage_limit_upstream(
                 http::Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "text/event-stream")
-                    .body(Body::from(codex_usage_limit_sse("usage_limit_reached")))
+                    .header("x-codex-primary-reset-after-seconds", "90")
+                    .header("x-codex-primary-reset-at", "1788879437")
+                    .header("x-codex-primary-window-minutes", "300")
+                    .body(Body::from(codex_header_only_usage_limit_sse()))
                     .unwrap()
             }
         }
@@ -1177,6 +1180,22 @@ fn codex_usage_limit_sse(error_type: &str) -> Vec<u8> {
     format!("data: {}\n\n", codex_usage_limit_event(error_type)).into_bytes()
 }
 
+fn codex_header_only_usage_limit_sse() -> Vec<u8> {
+    format!(
+        "data: {}\n\n",
+        json!({
+            "type": "error",
+            "status_code": 429,
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+                "resets_in_seconds": 90
+            }
+        })
+    )
+    .into_bytes()
+}
+
 async fn assert_usage_limit_response(response: Response) {
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(response.headers()["x-should-retry"], "false");
@@ -1234,6 +1253,53 @@ async fn smoke_codex_http_usage_limit_event_fast_fails_live_request() {
 
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_usage_limit_response(response).await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_header_only_usage_limit_event_fast_fails_live_request() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = axum::Router::new().fallback({
+        let attempts = attempts.clone();
+        move || {
+            let attempts = attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .header("x-codex-primary-reset-after-seconds", "90")
+                    .header("x-codex-primary-reset-at", "1788879437")
+                    .header("x-codex-primary-window-minutes", "300")
+                    .body(Body::from(codex_header_only_usage_limit_sse()))
+                    .unwrap()
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, mock).await.ok();
+    });
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", format!("http://{addr}"));
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
     let response = call_messages_body(json!({
         "model": "gpt-5.5",

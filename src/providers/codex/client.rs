@@ -374,6 +374,7 @@ struct DecodedHttpSseEvent {
 
 struct HttpEventStreamState {
     resp: reqwest::Response,
+    response_headers: Vec<(String, String)>,
     started_at: Instant,
     body_json: String,
     auth: StoredAuth,
@@ -1165,7 +1166,7 @@ impl CodexHttpClient {
         let mut auth_refresh_attempted = false;
         let use_responses_lite = body.client_metadata.is_some();
         let mut retries = 0_u32;
-        let (resp, started_at) = loop {
+        let (resp, response_headers, started_at) = loop {
             match self
                 .start_http_event_attempt(
                     &mut auth,
@@ -1195,6 +1196,7 @@ impl CodexHttpClient {
         Ok(self.spawn_http_event_stream(
             HttpEventStreamState {
                 resp,
+                response_headers,
                 started_at,
                 body_json,
                 auth,
@@ -1223,7 +1225,7 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         use_responses_lite: bool,
         auth_refresh_attempted: &mut bool,
-    ) -> Result<(reqwest::Response, Instant), CodexError> {
+    ) -> Result<(reqwest::Response, Vec<(String, String)>, Instant), CodexError> {
         loop {
             let (resp, started_at) = self
                 .start_post_http(auth, body_json, ctx, use_responses_lite)
@@ -1256,7 +1258,7 @@ impl CodexHttpClient {
                     &headers,
                 );
             }
-            return Ok((resp, started_at));
+            return Ok((resp, headers, started_at));
         }
     }
 
@@ -1314,6 +1316,7 @@ impl CodexHttpClient {
     ) -> CodexHttpEventReceiver {
         let HttpEventStreamState {
             mut resp,
+            mut response_headers,
             mut started_at,
             body_json,
             mut auth,
@@ -1490,7 +1493,10 @@ impl CodexHttpClient {
                         let event_kind = super::events::classify_stream_event(&payload);
                         let failure = super::events::classify_event_failure(&payload);
                         if !semantic_output_forwarded {
-                            if let Some(limit) = super::events::usage_limit_from_event(&payload) {
+                            if let Some(limit) = super::events::usage_limit_from_event_with_headers(
+                                &payload,
+                                &response_headers,
+                            ) {
                                 pending_events.clear();
                                 let _ = tx
                                     .send(Err(codex_usage_limit_error(
@@ -1600,8 +1606,9 @@ impl CodexHttpClient {
                         ) => result
                     };
                     match next_attempt {
-                        Ok((next_resp, next_started_at)) => {
+                        Ok((next_resp, next_response_headers, next_started_at)) => {
                             resp = next_resp;
+                            response_headers = next_response_headers;
                             started_at = next_started_at;
                             continue 'attempts;
                         }
@@ -3575,6 +3582,90 @@ mod tests {
             terminal.get("type").and_then(|value| value.as_str()),
             Some("response.completed")
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_stream_header_only_usage_limit_uses_response_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+            let body = br#"data: {"type":"error","status_code":429,"error":{"type":"usage_limit_reached","message":"weekly \"limit\" reached","resets_in_seconds":90}}
+
+"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nx-codex-secondary-reset-after-seconds: 90\r\nx-codex-secondary-reset-at: 1789466238\r\nx-codex-secondary-window-minutes: 10080\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+
+        let client = Arc::new(http_test_client(format!("http://{addr}/responses"), 1_000));
+        client.auth_manager().set_test_auth(http_test_auth());
+        let mut events = client
+            .stream_codex_http_events(&buffered_test_request(), &http_test_context())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events.recv().await.unwrap().unwrap().get("type"),
+            Some(&serde_json::json!("keepalive"))
+        );
+        let error = events.recv().await.unwrap().unwrap_err();
+        assert_eq!(error.status, 429);
+        let limit = error.usage_limit.expect("usage limit");
+        assert_eq!(limit.message, "weekly \"limit\" reached");
+        assert_eq!(limit.resets_at, Some(1789466238));
+        assert_eq!(limit.window, Some(CodexLimitWindow::SevenDay));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_stream_retries_with_current_attempt_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_request(&mut stream).await;
+                let (body, headers) = if attempt == 0 {
+                    (
+                        br#"data: {"type":"response.failed","status_code":503,"error":{"message":"server error","retry_after":"0"}}
+
+"#.as_slice(),
+                        "",
+                    )
+                } else {
+                    (
+                        br#"data: {"type":"error","status_code":429,"error":{"type":"usage_limit_reached","message":"weekly limit reached","resets_in_seconds":90}}
+
+"#.as_slice(),
+                        "x-codex-secondary-reset-after-seconds: 90\r\nx-codex-secondary-reset-at: 1789466238\r\nx-codex-secondary-window-minutes: 10080\r\n",
+                    )
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+
+        let client = Arc::new(http_test_client(format!("http://{addr}/responses"), 1_000));
+        client.auth_manager().set_test_auth(http_test_auth());
+        let mut events = client
+            .stream_codex_http_events(&buffered_test_request(), &http_test_context())
+            .await
+            .unwrap();
+        let _ = events.recv().await.unwrap().unwrap();
+        let error = events.recv().await.unwrap().unwrap_err();
+        let limit = error.usage_limit.expect("usage limit");
+        assert_eq!(limit.resets_at, Some(1789466238));
+        assert_eq!(limit.window, Some(CodexLimitWindow::SevenDay));
         server.await.unwrap();
     }
 
