@@ -66,6 +66,7 @@ impl SnapshotUpdate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorSnapshot {
     pub started_at: SystemTime,
+    pub uptime: Duration,
     pub sessions: Vec<SessionSnapshot>,
     pub active: Vec<ActiveSnapshot>,
     pub recent: Vec<CompletedSnapshot>,
@@ -75,6 +76,7 @@ impl From<MonitorState> for MonitorSnapshot {
     fn from(state: MonitorState) -> Self {
         Self {
             started_at: state.started_at,
+            uptime: state.uptime,
             sessions: state.sessions.into_iter().map(Into::into).collect(),
             active: state.active.into_iter().map(Into::into).collect(),
             recent: state.recent.into_iter().map(Into::into).collect(),
@@ -292,6 +294,7 @@ mod tests {
         assert!(!encoded.contains("instant"));
         let decoded: MonitorSnapshot = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, snapshot);
+        assert_eq!(decoded.uptime, snapshot.uptime);
         assert_eq!(decoded.active[0].elapsed(), snapshot.active[0].elapsed());
         assert_eq!(decoded.active[0].rate(), snapshot.active[0].rate());
         assert_eq!(decoded.sessions[0].rate(), snapshot.sessions[0].rate());

@@ -488,10 +488,6 @@ fn render_header(
     app: &MonitorApp,
     state: &MonitorSnapshot,
 ) {
-    let uptime = state
-        .started_at
-        .elapsed()
-        .unwrap_or_else(|_| Duration::from_secs(0));
     let text = Line::from(vec![
         Span::styled(
             " claude-code-proxy",
@@ -504,7 +500,7 @@ fn render_header(
         Span::styled(&app.listen_url, Style::default().fg(BG).bg(TEAL)),
         Span::styled("  uptime ", Style::default().fg(BG).bg(TEAL)),
         Span::styled(
-            format_duration(uptime),
+            format_duration(state.uptime),
             Style::default()
                 .fg(BG)
                 .bg(TEAL)

@@ -172,6 +172,7 @@ fn main() -> Result<()> {
                 .enable_all()
                 .build()?;
             let client = reqwest::Client::builder()
+                .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(2))
                 .build()?;
@@ -203,7 +204,13 @@ async fn run_service(config: ServerConfig) -> Result<()> {
         signal = service_shutdown_signal() => {
             signal?;
             let _ = shutdown.send(());
-            server.await
+            tokio::select! {
+                result = &mut server => result,
+                signal = service_shutdown_signal() => {
+                    signal?;
+                    Ok(())
+                }
+            }
         }
     }
 }

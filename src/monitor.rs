@@ -240,6 +240,7 @@ impl Throughput {
 #[derive(Debug, Clone)]
 pub struct MonitorState {
     pub started_at: SystemTime,
+    pub uptime: Duration,
     pub sessions: Vec<SessionSummary>,
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<CompletedRequest>,
@@ -284,6 +285,7 @@ impl SessionSummary {
 #[derive(Debug)]
 struct MonitorStore {
     started_at: SystemTime,
+    started_instant: Instant,
     active: HashMap<String, ActiveRequest>,
     recent: VecDeque<CompletedRequest>,
     session_usage: HashMap<Option<String>, SessionUsage>,
@@ -313,6 +315,7 @@ impl MonitorHandle {
         Self {
             store: Arc::new(Mutex::new(MonitorStore {
                 started_at: SystemTime::now(),
+                started_instant: Instant::now(),
                 active: HashMap::new(),
                 recent: VecDeque::new(),
                 session_usage: HashMap::new(),
@@ -333,6 +336,7 @@ impl MonitorHandle {
             Ok(store) => store.snapshot(),
             Err(_) => MonitorState {
                 started_at: SystemTime::now(),
+                uptime: Duration::ZERO,
                 sessions: Vec::new(),
                 active: Vec::new(),
                 recent: Vec::new(),
@@ -874,6 +878,7 @@ impl MonitorStore {
         );
         MonitorState {
             started_at: self.started_at,
+            uptime: self.started_instant.elapsed(),
             sessions,
             active,
             recent: self.recent.iter().cloned().collect(),
@@ -1093,6 +1098,22 @@ mod tests {
         assert_eq!(state.active[0].request_id, "r1");
         assert_eq!(state.active[0].session_id.as_deref(), Some("s1"));
         assert_eq!(state.active[0].session_seq, Some(3));
+    }
+
+    #[test]
+    fn uptime_uses_the_service_monotonic_clock() {
+        let monitor = MonitorHandle::new(10);
+        {
+            let mut store = monitor.store.lock().unwrap();
+            store.started_at = SystemTime::now() + Duration::from_secs(3_600);
+            store.started_instant = Instant::now() - Duration::from_secs(42);
+        }
+
+        let state = monitor.snapshot();
+
+        assert!(state.started_at > SystemTime::now());
+        assert!(state.uptime >= Duration::from_secs(42));
+        assert!(state.uptime < Duration::from_secs(43));
     }
 
     #[test]

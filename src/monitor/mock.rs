@@ -371,6 +371,7 @@ fn mock_state_for_tick(
     let sessions = session_summaries(&active, &recent, &session_usage, output_buckets);
     MonitorState {
         started_at,
+        uptime: now.duration_since(started_at).unwrap_or_default(),
         sessions,
         active,
         recent: recent.into_iter().collect(),

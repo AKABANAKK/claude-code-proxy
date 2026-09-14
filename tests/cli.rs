@@ -1,6 +1,14 @@
 use assert_cmd::Command;
 use predicates::str::contains;
 use std::env;
+#[cfg(unix)]
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    process::{Child, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
 
 #[test]
@@ -100,6 +108,87 @@ fn models_output_is_stable_order() -> Result<(), Box<dyn std::error::Error>> {
     assert!(codex_pos < kimi_pos);
     assert!(kimi_pos < cursor_pos);
     Ok(())
+}
+
+#[cfg(unix)]
+struct ChildGuard(Child);
+
+#[cfg(unix)]
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+fn plain_service_exits_on_second_signal(signal: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
+        .args(["serve", "--no-monitor", "--port", &port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut child = ChildGuard(child);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut held_connection = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(error) if Instant::now() < deadline => {
+                if let Some(status) = child.0.try_wait()? {
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = child.0.stderr.take() {
+                        pipe.read_to_string(&mut stderr)?;
+                    }
+                    return Err(format!("service exited with {status}: {stderr}").into());
+                }
+                let _ = error;
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    held_connection.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n")?;
+    thread::sleep(Duration::from_millis(100));
+
+    assert!(
+        std::process::Command::new("kill")
+            .args([signal, &child.0.id().to_string()])
+            .status()?
+            .success()
+    );
+    thread::sleep(Duration::from_millis(200));
+    assert!(child.0.try_wait()?.is_none());
+
+    assert!(
+        std::process::Command::new("kill")
+            .args([signal, &child.0.id().to_string()])
+            .status()?
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        if child.0.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("plain service did not exit after the second signal".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn plain_service_exits_on_second_ctrl_c() -> Result<(), Box<dyn std::error::Error>> {
+    plain_service_exits_on_second_signal("-INT")
+}
+
+#[cfg(unix)]
+#[test]
+fn plain_service_exits_on_second_sigterm() -> Result<(), Box<dyn std::error::Error>> {
+    plain_service_exits_on_second_signal("-TERM")
 }
 
 #[test]

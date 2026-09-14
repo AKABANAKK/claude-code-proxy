@@ -1,5 +1,6 @@
 use std::{
     net::SocketAddr,
+    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -229,6 +230,45 @@ async fn polling_keeps_last_snapshot_on_failure_and_recovers() {
     let after_drop = requests.load(Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(350)).await;
     assert_eq!(requests.load(Ordering::SeqCst), after_drop);
+}
+
+#[tokio::test]
+async fn production_monitor_client_bypasses_outbound_proxy_environment() {
+    fn snapshot_app(requests: Arc<AtomicUsize>) -> Router {
+        Router::new().route(
+            "/monitor",
+            get(move || {
+                requests.fetch_add(1, Ordering::SeqCst);
+                let response = MonitorResponse::from(MonitorHandle::default().snapshot());
+                async move { Json(response) }
+            }),
+        )
+    }
+
+    let target_requests = Arc::new(AtomicUsize::new(0));
+    let target = serve(snapshot_app(target_requests.clone())).await;
+    let proxy_requests = Arc::new(AtomicUsize::new(0));
+    let proxy = serve(snapshot_app(proxy_requests.clone())).await;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
+        .args(["monitor", "--url", target.url.as_str()])
+        .env("HTTP_PROXY", proxy.url.as_str())
+        .env("http_proxy", proxy.url.as_str())
+        .env("ALL_PROXY", proxy.url.as_str())
+        .env("all_proxy", proxy.url.as_str())
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_until(|| target_requests.load(Ordering::SeqCst) > 0).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(proxy_requests.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
