@@ -308,6 +308,14 @@ fn reasoning_summary_requested(summary: Option<&str>) -> bool {
     !matches!(summary, Some("off" | "none"))
 }
 
+/// Whether the resolved effort asks the upstream for reasoning output.
+/// `Effort::None` still names the effort so the wire request overrides the
+/// upstream default, but it must not request a summary or encrypted
+/// continuation content, which are reasoning artifacts.
+fn reasoning_requested(effort: Option<&Effort>) -> bool {
+    effort.is_some_and(|effort| *effort != Effort::None)
+}
+
 // ---------------------------------------------------------------------------
 // Compaction fast path
 // ---------------------------------------------------------------------------
@@ -576,8 +584,9 @@ fn translate_request_inner(
     if apply_codex_config && is_compact {
         resolved_effort = apply_compact_effort_cap(resolved_effort, compact_effort_cap());
     }
+    let wants_reasoning = reasoning_requested(resolved_effort.as_ref());
     if resolved_effort.is_some() || opts.use_responses_lite {
-        let summary = if resolved_effort.is_some()
+        let summary = if wants_reasoning
             && (!apply_codex_config
                 || reasoning_summary_requested(config::codex_reasoning_summary().as_deref()))
         {
@@ -591,7 +600,7 @@ fn translate_request_inner(
             context: opts.use_responses_lite.then_some("all_turns".to_string()),
         });
     }
-    if resolved_effort.is_some() {
+    if wants_reasoning {
         out.include = Some(vec!["reasoning.encrypted_content".to_string()]);
     }
 
@@ -1933,6 +1942,21 @@ mod tests {
             apply_compact_effort_cap(Some(Effort::High), None),
             Some(Effort::High)
         ));
+    }
+
+    #[test]
+    fn only_a_non_none_effort_requests_reasoning_artifacts() {
+        assert!(!reasoning_requested(None));
+        assert!(!reasoning_requested(Some(&Effort::None)));
+        for effort in [
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::Xhigh,
+            Effort::Max,
+        ] {
+            assert!(reasoning_requested(Some(&effort)));
+        }
     }
 
     #[test]
