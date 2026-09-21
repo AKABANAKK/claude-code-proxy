@@ -1259,7 +1259,7 @@ async fn smoke_codex_http_usage_limit_event_fast_fails_live_request() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let upstream = spawn_http_upstream({
@@ -1292,7 +1292,7 @@ async fn smoke_codex_http_header_only_usage_limit_event_fast_fails_live_request(
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1339,7 +1339,7 @@ async fn smoke_codex_http_usage_limit_event_fast_fails_buffered_request() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let upstream = spawn_http_upstream({
@@ -1615,7 +1615,7 @@ async fn smoke_codex_http_server_compaction_fast_fails_usage_limit() {
     let _guard = env_lock();
     clear_all_compactions_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let upstream = spawn_http_upstream({
@@ -2280,7 +2280,7 @@ async fn smoke_codex_http_usage_limit_status_fast_fails_live_request() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2678,7 +2678,7 @@ async fn smoke_codex_auto_fallback_usage_limit_fast_fails_live_request() {
     clear_all_continuations_for_tests();
     clear_codex_websocket_pool_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let websocket_attempts = Arc::new(AtomicUsize::new(0));
     let http_attempts = Arc::new(AtomicUsize::new(0));
@@ -2762,7 +2762,7 @@ async fn smoke_codex_websocket_usage_limit_fast_fails_request() {
     clear_all_continuations_for_tests();
     clear_codex_websocket_pool_for_tests();
     let config = TempDir::new().unwrap();
-    write_auth(config.path(), "codex");
+    let _codex_auth = write_codex_auth(config.path());
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let upstream = spawn_websocket_usage_limit_upstream(attempts.clone()).await;
