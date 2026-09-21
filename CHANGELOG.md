@@ -3,6 +3,50 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## v0.1.41 (2026-09-19)
+
+- Long Codex requests on the HTTP transport no longer hang for minutes and then
+  fail: the proxy waits five minutes for the response headers instead of one,
+  configurable with `CCP_CODEX_HEADER_TIMEOUT_MS` or `codex.headerTimeoutMs`,
+  and a timeout there fails the request once rather than re-sending it.
+  ([#160](https://github.com/raine/claude-code-proxy/pull/160))
+- The installer correctly reports the existing version during upgrades instead
+  of showing it as unknown.
+  ([#157](https://github.com/raine/claude-code-proxy/issues/157))
+- Codex requests use the current session header for cache affinity, improving
+  compatibility with intermediaries that reject the legacy header.
+  ([#156](https://github.com/raine/claude-code-proxy/pull/156))
+
+## v0.1.40 (2026-09-14)
+
+- Attach one or more monitor dashboards to a background proxy with
+  `claude-code-proxy monitor`; dashboards reconnect automatically and detach
+  without stopping the service.
+  ([#134](https://github.com/raine/claude-code-proxy/pull/134))
+- Monitor activity graphs remain accurate across machines with different clocks,
+  and long-running proxies no longer accumulate unbounded monitor history.
+  ([#134](https://github.com/raine/claude-code-proxy/pull/134))
+- Exhausted Codex subscription limits now fail immediately instead of retrying
+  for minutes, while preserving reset details for clients.
+  ([#139](https://github.com/raine/claude-code-proxy/pull/139))
+- HTTP connections honor the platform trust store, `SSL_CERT_FILE`, and
+  `SSL_CERT_DIR`, enabling private certificate authorities and TLS-inspecting
+  proxies. ([#143](https://github.com/raine/claude-code-proxy/pull/143))
+- Codex compaction requests that omit a reasoning effort now use the configured
+  compaction effort cap, reducing unnecessary latency and token usage.
+  ([#151](https://github.com/raine/claude-code-proxy/pull/151))
+- Image-heavy Claude Code sessions can send Anthropic-compatible requests up to
+  64 MiB instead of becoming unusable after crossing the previous 16 MiB limit.
+  ([#152](https://github.com/raine/claude-code-proxy/pull/152))
+- Structured traffic captures redact replayable Codex compaction and reasoning
+  data, reducing sensitive capture contents and file size.
+  ([#153](https://github.com/raine/claude-code-proxy/pull/153))
+- Grok streams show estimated input usage from the start and use the provider's
+  exact total when available, so Claude Code's status bar no longer stays at
+  zero input tokens. Grok 4.5 and 4.6 users can also configure Claude Code for
+  their 500K context window.
+  ([#154](https://github.com/raine/claude-code-proxy/pull/154))
+
 ## v0.1.39 (2026-09-10)
 
 - OpenCode Go users can select 14 additional models, including Grok 4.6, GLM 5.3,
