@@ -2276,14 +2276,14 @@ where
                                     "data": text,
                                 }),
                             );
+                            sse_body.extend_from_slice(&encode_sse(&text));
                         }
-                        sse_body.extend_from_slice(&encode_sse(&text));
                         continue;
                     }
                 };
 
-                sse_body.extend_from_slice(&encode_sse(&text));
                 if let Some(tc) = traffic.as_deref() {
+                    sse_body.extend_from_slice(&encode_sse(&text));
                     tc.write_json_event("040-upstream-event", &parsed);
                 }
 
@@ -2387,6 +2387,106 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     use super::*;
+
+    #[tokio::test]
+    async fn live_stream_traffic_capture_preserves_raw_frames_and_event_order() {
+        const STREAM_CAPTURE_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+        let delta = serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": "answer"
+        });
+        let invalid = "{ invalid\njson";
+        for (terminal, expected_reusable, status, body_file) in [
+            (
+                serde_json::json!({
+                    "type": "response.completed",
+                    "response": {"id": "capture-response"}
+                }),
+                true,
+                http::StatusCode::OK,
+                "002-032-upstream-response-body.sse",
+            ),
+            (
+                serde_json::json!({
+                    "type": "error",
+                    "error": {"status": 429, "code": "rate_limit_exceeded", "message": "limited"}
+                }),
+                false,
+                http::StatusCode::TOO_MANY_REQUESTS,
+                "002-031-upstream-error-body.txt",
+            ),
+        ] {
+            for capture_enabled in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let traffic = capture_enabled.then(|| {
+                    Arc::new(crate::traffic::test_capture(directory.path().to_path_buf()))
+                });
+                let frames = vec![invalid.to_string(), delta.to_string(), terminal.to_string()];
+                let expected_body: Vec<u8> =
+                    frames.iter().flat_map(|frame| encode_sse(frame)).collect();
+                let (sender, mut receiver) = mpsc::channel(frames.len());
+                let (client_io, server_io) = tokio::io::duplex(expected_body.len());
+                let mut client =
+                    WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+                let mut server =
+                    WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+                let upstream = tokio::spawn(async move {
+                    for frame in frames {
+                        server.send(Message::Text(frame)).await.unwrap();
+                    }
+                });
+                let (reusable, terminal_item) = tokio::time::timeout(
+                    STREAM_CAPTURE_TEST_TIMEOUT,
+                    stream_ws_events(&mut client, WEBSOCKET_IDLE_TIMEOUT_MS, traffic, &sender),
+                )
+                .await
+                .expect("WebSocketのテスト応答が完了する");
+                upstream.await.unwrap();
+                drop(sender);
+                assert_eq!(reusable, expected_reusable);
+                assert_eq!(terminal_item.unwrap().unwrap(), terminal);
+                assert_eq!(receiver.recv().await.unwrap().unwrap(), delta);
+                assert!(receiver.recv().await.is_none());
+
+                if capture_enabled {
+                    assert_eq!(
+                        std::fs::read(directory.path().join(body_file)).unwrap(),
+                        expected_body
+                    );
+                    let headers: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(
+                            directory
+                                .path()
+                                .join("001-030-upstream-response-headers.json"),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(headers["status"], status.as_u16());
+                    let first_event: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(
+                            directory
+                                .path()
+                                .join("events/000001-040-upstream-event.json"),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(first_event["unparseable"], true);
+                    assert_eq!(first_event["data"], invalid);
+                    assert_eq!(
+                        std::fs::read_dir(directory.path().join("events"))
+                            .unwrap()
+                            .count(),
+                        3
+                    );
+                } else {
+                    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+                }
+            }
+        }
+    }
 
     #[test]
     fn provider_retry_handoff_is_attempt_local() {

@@ -67,7 +67,7 @@ pub const TERM_INCOMPLETE: &str = "response.incomplete";
 pub const TERM_DONE: &str = "response.done";
 
 const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
-const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
+pub(super) const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
 
 #[derive(Debug, Clone)]
 pub enum ReducerEvent {
@@ -159,7 +159,7 @@ struct ActiveThinking {
     anthropic_index: usize,
 }
 
-fn reasoning_input_item(replay: ReasoningReplay) -> ResponsesInputItem {
+pub(super) fn reasoning_input_item(replay: ReasoningReplay) -> ResponsesInputItem {
     ResponsesInputItem::Reasoning {
         id: replay.id,
         summary: Vec::new(),
