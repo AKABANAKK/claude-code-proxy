@@ -210,7 +210,7 @@ impl Provider for IdentityCaptureProvider {
     }
 
     fn supported_models(&self) -> Vec<String> {
-        vec!["gpt-5.5".to_string(), "gpt-5.6-luna".to_string()]
+        vec!["gpt-5.5".to_string(), "gpt-6-luna".to_string()]
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {
@@ -663,11 +663,11 @@ async fn auto_review_codex_dispatch_releases_raw_body() {
                 "text": "You are a security monitor for autonomous AI coding agents. Review this turn."
             }]
         }),
-        "gpt-5.6-luna",
+        "gpt-6-luna",
         AliasProvider::Codex,
         FakeProvider {
             name: "codex",
-            models: vec!["gpt-5.5".to_string(), "gpt-5.6-luna".to_string()],
+            models: vec!["gpt-5.5".to_string(), "gpt-6-luna".to_string()],
         },
         None,
     )
@@ -686,11 +686,11 @@ async fn auto_review_non_codex_dispatch_preserves_raw_request() {
                 "text": "You are a security monitor for autonomous AI coding agents. Review this turn."
             }]
         }),
-        "gpt-5.6-luna",
+        "gpt-6-luna",
         AliasProvider::Codex,
         FakeProvider {
             name: "kimi",
-            models: vec!["gpt-5.6-luna".to_string()],
+            models: vec!["gpt-6-luna".to_string()],
         },
         Some(FakeProvider {
             name: "codex",
