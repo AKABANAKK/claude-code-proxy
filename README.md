@@ -122,11 +122,65 @@ export ANTHROPIC_CUSTOM_MODEL_OPTION="gpt-6-astra"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES="effort,xhigh_effort,max_effort"
 ```
 
+### Multiple Claude accounts
+
+For each Claude subscription account, run `claude setup-token`, then register
+the resulting token under a unique name:
+
+```sh
+claude-code-proxy anthropic accounts add personal
+claude-code-proxy anthropic accounts add work
+claude-code-proxy anthropic accounts list
+```
+
+Each `add` command reads the token from standard input. Keep Claude Code logged
+in normally, with `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` unset. Restart
+the proxy after adding or removing accounts. Once accounts are registered, the
+proxy replaces the forwarded `Authorization` header with the selected token.
+
+The proxy stays on one account until a reported five-hour, weekly, or `7d_oi`
+weekly window reaches **98%** usage, then advances in registration order,
+wrapping to the first account. A recovered account does not interrupt the current
+one. Set `CCP_ANTHROPIC_SWITCH_THRESHOLD=0.95` (or `95`) to switch at 95%, or
+`CCP_ANTHROPIC_ACTIVE_ACCOUNT=work` to choose the account used at startup.
+
+On HTTP 429, the proxy temporarily blocks the account and retries the same
+request with another account, trying each account at most once. If no further
+account can be selected, it returns the last 429. A 401 invalidates that account
+until restart and is returned immediately. If all registered accounts are
+invalid, subsequent requests use Claude Code's original login.
+
+The selected account, block reason, and retries appear in `proxy.log` as
+`anthropic_account_selected`, `anthropic_account_blocked`,
+`anthropic_account_invalid`, and `anthropic_account_retry`. Selection events show
+both `registeredAccountCount` (the current registration file) and
+`loadedAccountCount` (the running proxy). `registrationReloadRequired: true`
+means registrations changed and a restart is needed. Counts also show eligible,
+blocked, and invalid accounts, with `allAccountsUnavailable` when none are eligible.
+
+Usage snapshots are stored separately, one JSON file per account, under
+`<state-root>/anthropic/accounts/` (for example,
+`~/.local/state/claude-code-proxy/anthropic/accounts/first.json`). They include
+the last observed utilization, observation time, and reset time for `5h`, `7d`,
+and `7d_oi`. At server startup, the proxy refreshes every registered account with
+one small Fable request (`max_tokens: 1`) before accepting client requests. This
+consumes a small amount of allowance and can start an unused five-hour window.
+The observations update both the snapshots and the account pool; the probes do
+not advance the preferred account. Failed probes do not prevent startup, and
+unknown windows remain `null`. Read-only commands such as `models` do not probe
+accounts or overwrite snapshots. See
+[Files and storage](docs/src/content/docs/reference/files-and-storage.md)
+for snapshot freshness, refresh logs, and field details.
+
+Switching accounts
+can lose prompt-cache reuse and increase usage on the next request. With no
+registered accounts, the proxy forwards Claude Code's login as before.
+
 ## Providers
 
 | Provider     | Account                        | Model selection                                 |
 | ------------ | ------------------------------ | ----------------------------------------------- |
-| Claude       | Claude subscription (Claude Code's own login) | `claude-*` models and the `opus`, `sonnet`, `haiku` aliases |
+| Claude       | Claude subscription (Claude Code's login or registered accounts) | `claude-*` models and the `opus`, `sonnet`, `haiku` aliases |
 | Codex        | ChatGPT Plus or Pro            | Registered `gpt-*` models and `-fast` variants  |
 | Kimi         | kimi.com with Kimi Code access | `kimi-for-coding` and aliases                   |
 | Grok         | grok.com                       | Registered Grok models                          |

@@ -149,6 +149,18 @@ pub async fn serve_listener(
 ) -> anyhow::Result<()> {
     let local_addr = listener.local_addr()?;
     let port = local_addr.port();
+    let registry = Arc::new(Registry::with_default_alias());
+    let mut shutdown = Box::pin(shutdown);
+    tokio::select! {
+        _ = async {
+            for name in registry.list_provider_names() {
+                if let Some(provider) = registry.provider(&name) {
+                    provider.initialize().await;
+                }
+            }
+        } => {}
+        _ = &mut shutdown => return Ok(()),
+    }
     create_logger("server").info(
         "server listening",
         Some(serde_json::Map::from_iter([
@@ -167,7 +179,7 @@ pub async fn serve_listener(
             ),
         ])),
     );
-    let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
+    let app = app_with_monitor(registry, monitor);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

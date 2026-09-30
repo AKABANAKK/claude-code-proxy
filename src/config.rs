@@ -1,3 +1,8 @@
+mod anthropic;
+pub use anthropic::{
+    DEFAULT_ANTHROPIC_SWITCH_THRESHOLD, anthropic_active_account, anthropic_switch_threshold,
+};
+
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -47,6 +52,7 @@ struct FileConfig {
     pub cursor: Option<CursorConfig>,
     pub grok: Option<GrokConfig>,
     pub opencode: Option<OpenCodeConfig>,
+    pub anthropic: Option<anthropic::AnthropicConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -302,6 +308,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     }
     if env.contains_key("CCP_OPENCODE_BASE_URL") {
         out.push("opencode.baseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_ANTHROPIC_SWITCH_THRESHOLD") {
+        out.push("anthropic.switchThreshold (env)".to_string());
+    }
+    if env.contains_key("CCP_ANTHROPIC_ACTIVE_ACCOUNT") {
+        out.push("anthropic.activeAccount (env)".to_string());
     }
     if env
         .get("CCP_CODEX_REASONING_SUMMARY")

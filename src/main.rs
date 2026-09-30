@@ -4,6 +4,7 @@ use claude_code_proxy::{
     config, logging,
     monitor::MonitorHandle,
     paths,
+    providers::anthropic::accounts_cli,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
     server::{self, ServerConfig},
     tui::{self, MonitorExit, MonitorUiConfig},
@@ -70,6 +71,11 @@ enum Commands {
     Grok {
         #[command(subcommand)]
         command: ProviderGroup,
+    },
+    /// Manage Claude accounts for the Anthropic passthrough
+    Anthropic {
+        #[command(subcommand)]
+        command: accounts_cli::Command,
     },
 }
 
@@ -190,6 +196,7 @@ fn main() -> Result<()> {
         Commands::Kimi { command } => run_provider_cli("kimi", command),
         Commands::Cursor { command } => run_provider_cli("cursor", command),
         Commands::Grok { command } => run_provider_cli("grok", command),
+        Commands::Anthropic { command } => command.run(),
     }
 }
 

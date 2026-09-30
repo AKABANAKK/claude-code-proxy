@@ -26,6 +26,11 @@ pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
     fn supported_models(&self) -> Vec<String>;
     fn cli(&self) -> &'static dyn CliHandlers;
+
+    /// Prepare a running server before accepting requests. Read-only CLI commands
+    /// construct providers without calling this hook.
+    async fn initialize(&self) {}
+
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
 
     async fn handle_messages_with_conversation_identity(

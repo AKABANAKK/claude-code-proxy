@@ -5,8 +5,17 @@
 //! its own subscription credentials (`Authorization: Bearer sk-ant-oat...`) plus the
 //! `anthropic-beta` flags that drive prompt caching. So the correct behavior is a
 //! transparent reverse proxy: relay the original body bytes and headers to
-//! api.anthropic.com and stream the response straight back. The proxy holds zero
-//! Anthropic credentials and never touches the cache-keyed request prefix.
+//! api.anthropic.com and stream the response straight back. Registered accounts can
+//! replace the forwarded credentials; the cache-keyed request prefix is preserved.
+
+mod account_relay;
+#[cfg(test)]
+mod account_tests;
+mod account_usage;
+pub mod accounts;
+pub mod accounts_cli;
+pub mod pool;
+pub mod ratelimit;
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -172,6 +181,7 @@ fn is_stripped_response_header(name: &str) -> bool {
 pub struct AnthropicProvider {
     client: reqwest::Client,
     base_url: String,
+    accounts: account_relay::AccountRelay,
 }
 
 impl AnthropicProvider {
@@ -183,12 +193,14 @@ impl AnthropicProvider {
         Self {
             client,
             base_url: crate::config::anthropic_base_url(),
+            accounts: account_relay::AccountRelay::new(),
         }
     }
 
     async fn relay(&self, ctx: RequestContext) -> Response {
         let RequestContext {
             req_id,
+            traffic,
             monitor,
             passthrough,
             ..
@@ -222,11 +234,12 @@ impl AnthropicProvider {
         };
 
         let upstream = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .body(outgoing)
-            .send()
+            .accounts
+            .send(
+                self.client.post(&url).headers(headers).body(outgoing),
+                &req_id,
+                traffic.as_deref(),
+            )
             .await;
 
         match upstream {
@@ -245,11 +258,7 @@ impl AnthropicProvider {
                 *response.headers_mut() = out_headers;
                 response
             }
-            Err(err) => json_error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                format!("anthropic upstream request failed: {err}"),
-            ),
+            Err(response) => response,
         }
     }
 }
@@ -275,6 +284,10 @@ impl Provider for AnthropicProvider {
 
     fn cli(&self) -> &'static dyn CliHandlers {
         &ANTHROPIC_CLI
+    }
+
+    async fn initialize(&self) {
+        self.accounts.initialize(&self.client, &self.base_url).await;
     }
 
     async fn handle_messages(&self, _body: MessagesRequest, ctx: RequestContext) -> Response {

@@ -49,6 +49,9 @@ These settings configure the proxy process. Claude Code client settings such as 
     "clientVersion": "0.48.5",
     "agentBundle": "/path/to/cursor-agent/index.js"
   },
+  "anthropic": {
+    "switchThreshold": 0.98
+  },
   "log": {
     "stderr": false,
     "verbose": false
@@ -154,6 +157,42 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | `CCP_CURSOR_CLIENT_VERSION` | `cursor.clientVersion` | `0.48.5` | Changes Cursor client version headers. |
 | `CCP_CURSOR_AGENT_BUNDLE` | `cursor.agentBundle` | Auto-detected | Points to Cursor Agent's bundled `index.js` protobuf schemas. |
 | `CCP_CURSOR_AUTH_TOKEN` | none | unset | Uses a bearer token instead of proxy-owned Cursor auth storage. |
+
+## Claude
+
+These settings apply to the Anthropic passthrough route. Register subscription
+tokens with the [Claude accounts commands](/reference/command-reference/#claude-accounts).
+
+| Environment | Config key | Default | Purpose |
+| --- | --- | --- | --- |
+| `CCP_ANTHROPIC_BASE_URL` | none | `https://api.anthropic.com` | Changes the Anthropic upstream. |
+| `CCP_ANTHROPIC_SWITCH_THRESHOLD` | `anthropic.switchThreshold` | `0.98` | Switches accounts when any watched usage window reaches this fraction. |
+| `CCP_ANTHROPIC_ACTIVE_ACCOUNT` | none | First registered account | Selects an account by name at startup. Unknown names fall back to the first account. |
+
+The threshold accepts fractions in `(0, 1]`, or percentages greater than `1`
+through `100`: `0.98` and `98` both mean 98%. Invalid values fall through to the
+next source in the precedence order. Upstream utilization headers are always
+read as fractions, including values above `1.0`.
+
+The watched windows are `5h`, `7d`, and `7d_oi`, whenever their utilization
+headers are present; the requested model does not change which windows count.
+An account at or above the threshold is blocked until the reported reset time,
+or for 15 minutes if that time is unavailable. HTTP 429 also blocks the account
+for the integer `retry-after` seconds, or 15 minutes when missing or invalid.
+When several blocks apply, the latest recovery time wins.
+
+The proxy stays on the selected account while it is available, then moves in
+registration order and wraps around. If every valid account is blocked, it
+tries the account with the earliest recovery time. HTTP 429 can trigger a retry
+with another account, with at most one attempt per account per request; when
+there is no further selection, the last 429 is returned. Other statuses are not
+retried. HTTP 401 removes that account from selection until the proxy restarts.
+If none remain valid, subsequent requests forward Claude Code's original login.
+
+Account settings and registrations are loaded at startup. Restart the proxy
+after changing them. Account selection and block state are held in memory;
+`anthropic accounts list` shows registrations, not live usage or block state.
+Selection, blocking, invalidation, and retries are recorded in `proxy.log`.
 
 ## Shared compatibility fallbacks
 
