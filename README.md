@@ -168,7 +168,10 @@ consumes a small amount of allowance and can start an unused five-hour window.
 The observations update both the snapshots and the account pool; the probes do
 not advance the preferred account. Failed probes do not prevent startup, and
 unknown windows remain `null`. Read-only commands such as `models` do not probe
-accounts or overwrite snapshots. See
+accounts or overwrite snapshots. During normal traffic, snapshots are saved in
+the background without delaying responses; pending updates for the same account
+are combined into the newest snapshot. Startup and normal shutdown wait for
+pending saves. See
 [Files and storage](docs/src/content/docs/reference/files-and-storage.md)
 for snapshot freshness, refresh logs, and field details.
 

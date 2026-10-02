@@ -93,7 +93,7 @@ impl AccountRelay {
                         let events = pool.observe(&selection, status, &observation, now);
                         self.save_usage(
                             &selection.account.name,
-                            &pool.usage_snapshot(&selection, now),
+                            pool.usage_snapshot(&selection, now),
                         );
                         (events, pool.count_fields(now))
                     };
@@ -120,6 +120,9 @@ impl AccountRelay {
                 }
             }
         }
+        if let Some(files) = &self.usage_files {
+            files.flush().await;
+        }
         let mut fields = lock_pool(pool).count_fields(now_unix_secs());
         fields.insert("failedAccountCount".into(), serde_json::json!(failures));
         log.info("anthropic_accounts_refresh_completed", Some(fields));
@@ -127,22 +130,13 @@ impl AccountRelay {
 
     fn save_all_usage(&self, pool: &AccountPool, now: u64) {
         for (account, snapshot) in pool.usage_snapshots(now) {
-            self.save_usage(account, &snapshot);
+            self.save_usage(account, snapshot);
         }
     }
 
-    fn save_usage(&self, account: &str, snapshot: &Value) {
-        if let Some(files) = &self.usage_files
-            && let Err(err) = files.write(account, snapshot)
-        {
-            create_logger("anthropic").warn(
-                "anthropic_account_usage_write_failed",
-                Some(serde_json::Map::from_iter([
-                    ("account".into(), serde_json::json!(account)),
-                    ("directory".into(), serde_json::json!(files.directory())),
-                    ("error".into(), serde_json::json!(err.to_string())),
-                ])),
-            );
+    fn save_usage(&self, account: &str, snapshot: Value) {
+        if let Some(files) = &self.usage_files {
+            files.write(account, snapshot);
         }
     }
 
@@ -195,11 +189,11 @@ impl AccountRelay {
                 let mut pool = lock_pool(pool);
                 let now = now_unix_secs();
                 let events = pool.observe(&selection, status, &observation, now);
-                // Serialize writes with observations so an older snapshot cannot
-                // overwrite a newer one when responses arrive concurrently.
+                // Enqueue under the pool lock to preserve observation order;
+                // the background writer handles slow disk I/O independently.
                 self.save_usage(
                     &selection.account.name,
-                    &pool.usage_snapshot(&selection, now),
+                    pool.usage_snapshot(&selection, now),
                 );
                 (events, pool.count_fields(now))
             };
@@ -493,6 +487,94 @@ fn log_pool_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_usage_disk_does_not_delay_failover_or_streaming() {
+        use super::super::account_usage::ReleaseWriterOnDrop;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().to_path_buf();
+        let (started, writing) = tokio::sync::oneshot::channel();
+        let started = Mutex::new(Some(started));
+        let (release, released) = std::sync::mpsc::channel();
+        let files = UsageFiles::with_writer(path.clone(), move |account, snapshot| {
+            if let Some(started) = started.lock().unwrap().take() {
+                let _ = started.send(());
+                let _ = released.recv();
+            }
+            crate::auth::write_atomically(
+                &path.join(format!("{account}.json")).to_string_lossy(),
+                snapshot,
+            )
+        });
+        let relay = AccountRelay {
+            pool: Some(Mutex::new(AccountPool::new(
+                ["test-first", "test-second"]
+                    .into_iter()
+                    .map(|name| PoolAccount {
+                        name: name.into(),
+                        token: format!("token-{name}"),
+                    })
+                    .collect(),
+                0.98,
+                None,
+            ))),
+            usage_files: Some(files),
+        };
+        let release = ReleaseWriterOnDrop(release);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let mock = tokio::spawn(async move {
+            let mut writing = Some(writing);
+            for account in ["test-first", "test-second"] {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let length = connection.read(&mut chunk).await.unwrap();
+                    assert!(length > 0);
+                    request.extend_from_slice(&chunk[..length]);
+                }
+                assert!(
+                    String::from_utf8(request)
+                        .unwrap()
+                        .contains(&format!("authorization: Bearer token-{account}"))
+                );
+                if let Some(writing) = writing.take() {
+                    writing.await.unwrap();
+                }
+                let response: &[u8] = if account == "test-first" {
+                    b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 30\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                } else {
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: ping\n\n"
+                };
+                connection.write_all(response).await.unwrap();
+            }
+        });
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            relay.send(reqwest::Client::new().get(url), "req-slow-writer", None),
+        )
+        .await
+        .expect("a blocked disk writer must not block the runtime or account pool")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert_eq!(response.bytes().await.unwrap(), "data: ping\n\n");
+        mock.await.unwrap();
+        drop(release);
+        relay.usage_files.as_ref().unwrap().flush().await;
+        for (account, status, eligible) in [("test-first", 429, false), ("test-second", 200, true)]
+        {
+            let snapshot: Value = serde_json::from_slice(
+                &std::fs::read(directory.path().join(format!("{account}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(snapshot["lastResponseStatus"], status);
+            assert_eq!(snapshot["eligible"], eligible);
+        }
+    }
 
     #[test]
     fn selection_log_distinguishes_six_registered_from_two_loaded_accounts() {

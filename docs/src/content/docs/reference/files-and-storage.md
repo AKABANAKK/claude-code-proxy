@@ -79,6 +79,15 @@ headers counts as a failed refresh; unavailable windows are never reported as ze
 During normal traffic, the first account selection and each account switch
 refresh all loaded accounts' snapshots, and each upstream response updates the
 responding account. Previously observed windows are retained within the process.
+Disk writes run on a dedicated worker without delaying upstream responses or
+holding the account pool lock. Pending updates for the same account are combined
+into its newest snapshot, so JSON files can briefly lag behind the running pool.
+The worker preserves observation order and bounds queued snapshots by the number
+of loaded accounts. Startup waits for its queued writes before accepting requests,
+and normal shutdown drains pending writes.
+Runtime snapshots use atomic replacement with OS-managed disk writeback, avoiding
+a forced disk synchronization for every observation. Their contents are recreated
+from the startup probes.
 Commands such as `models` or `kimi auth status` do not query accounts or create
 or overwrite snapshots. Files are replaced atomically; a write failure produces
 `anthropic_account_usage_write_failed` without failing requests or startup.
@@ -104,8 +113,9 @@ in a later response preserve the previous observation and its original time.
 `state` is `below_threshold`, `threshold_reached`, or `reset_elapsed`, evaluated
 at the snapshot's `asOf`. `reset_elapsed` means the advertised reset time has
 passed; the previous utilization remains visible until a new response confirms
-usage in the next window. Files do not update while the proxy is idle, so compare
-reset and block times with the current time when reading an older snapshot.
+usage in the next window. After queued writes finish, files do not update while
+the proxy is idle, so compare reset and block times with the current time when
+reading an older snapshot.
 
 Lowercase letters, digits, `-`, and `_` are used directly in filenames. Other
 bytes, including uppercase letters, are percent-encoded to avoid path traversal

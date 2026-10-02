@@ -109,7 +109,7 @@ impl Logger {
             let _ = writeln!(io::stderr(), "{line}");
         }
 
-        if write_log_line(&line).is_err() && mirror_to_stderr {
+        if write_log_line(line).is_err() && mirror_to_stderr {
             // swallow logging errors intentionally
         }
     }
@@ -122,7 +122,7 @@ pub fn create_logger(service: &str) -> Logger {
     }
 }
 
-fn write_log_line(line: &str) -> io::Result<()> {
+fn write_log_line(line: String) -> io::Result<()> {
     let file = log_file();
     if let Some(dir) = file.parent() {
         create_dir(dir, 0o700)?;
@@ -132,10 +132,14 @@ fn write_log_line(line: &str) -> io::Result<()> {
         rotate_file(&file)?;
     }
 
-    let mut out = OpenOptions::new().create(true).append(true).open(&file)?;
-    out.write_all(line.as_bytes())?;
-    out.write_all(b"\n")?;
-    Ok(())
+    append_log_line(&file, line)
+}
+
+fn append_log_line(path: &Path, mut line: String) -> io::Result<()> {
+    let mut out = OpenOptions::new().create(true).append(true).open(path)?;
+    // Append the record and newline together so concurrent writers cannot join lines.
+    line.push('\n');
+    out.write_all(line.as_bytes())
 }
 
 fn rotate_file(path: &Path) -> io::Result<()> {
@@ -232,6 +236,40 @@ mod tests {
     use std::sync::Mutex;
 
     static STDERR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn concurrent_appends_preserve_complete_json_lines() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("proxy.log");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for sequence in 0..1000 {
+                        append_log_line(
+                            path,
+                            serde_json::json!({"worker": worker, "sequence": sequence}).to_string(),
+                        )
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut records = HashSet::new();
+        for line in text.lines() {
+            let record: Value =
+                serde_json::from_str(line).expect("one complete JSON record per line");
+            assert!(records.insert((
+                record["worker"].as_u64().unwrap(),
+                record["sequence"].as_u64().unwrap(),
+            )));
+        }
+        assert_eq!(records.len(), 8000);
+    }
 
     #[test]
     fn stderr_suppression_disables_level_mirroring() {
