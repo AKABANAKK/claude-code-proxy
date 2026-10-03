@@ -52,6 +52,12 @@ fn relay_context() -> RequestContext {
     }
 }
 
+async fn relay_request(provider: &AnthropicProvider) -> Response {
+    let ctx = relay_context();
+    let body = serde_json::from_slice(&ctx.passthrough.as_ref().unwrap().raw_body).unwrap();
+    provider.handle_messages(body, ctx).await
+}
+
 fn registered_pool() -> AccountPool {
     AccountPool::new(
         vec![PoolAccount {
@@ -157,7 +163,7 @@ async fn relay_through_mock_with_usage_directory(
     let mut relayed = Vec::new();
     for _ in 0..relay_count {
         relayed.push(
-            tokio::time::timeout(Duration::from_secs(5), provider.relay(relay_context()))
+            tokio::time::timeout(Duration::from_secs(5), relay_request(&provider))
                 .await
                 .expect("relay completes"),
         );
@@ -171,6 +177,59 @@ async fn relay_through_mock_with_usage_directory(
 
 fn response_statuses(responses: &[Response]) -> Vec<StatusCode> {
     responses.iter().map(Response::status).collect()
+}
+
+#[tokio::test]
+async fn message_and_count_tokens_relays_preserve_original_body_bytes() {
+    // Whitespace, escaped keys and unknown message fields must all survive the fast path.
+    let raw = br#"{ "model" : "claude-original", "messages": [
+        {"role":"assistant", "unknown":true, "content":[
+            {"type":"th\u0069nking", "thinking":"signed", "signature":"sig"}
+        ]}
+    ] }"#;
+    for count_tokens in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            stream.write_all(MOCK_OK_RESPONSE).await.unwrap();
+            request
+        });
+        let provider = AnthropicProvider {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{addr}"),
+            accounts: AccountRelay::with_pool(None),
+        };
+        let mut ctx = relay_context();
+        let passthrough = ctx.passthrough.as_mut().unwrap();
+        passthrough.raw_body = axum::body::Bytes::from_static(raw);
+        let path = if count_tokens {
+            "/v1/messages/count_tokens"
+        } else {
+            MESSAGES_PATH
+        };
+        passthrough.path_and_query = path.to_string();
+        let mut body: crate::anthropic::schema::MessagesRequest =
+            serde_json::from_slice(raw).unwrap();
+        body.model = Some("normalized-model".to_string());
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            if count_tokens {
+                provider.handle_count_tokens(body, ctx).await
+            } else {
+                provider.handle_messages(body, ctx).await
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request.starts_with(&format!("POST {path} HTTP/1.1\r\n")));
+        assert_eq!(request.split_once("\r\n\r\n").unwrap().1.as_bytes(), raw);
+    }
 }
 
 #[tokio::test]
@@ -373,7 +432,7 @@ async fn malformed_upstream_url_remains_a_bad_gateway_with_or_without_accounts()
             accounts: AccountRelay::with_pool(pool),
         };
         assert_eq!(
-            provider.relay(relay_context()).await.status(),
+            relay_request(&provider).await.status(),
             StatusCode::BAD_GATEWAY
         );
     }
@@ -396,7 +455,7 @@ async fn invalid_token_is_reported_without_exposing_it() {
         accounts: AccountRelay::with_pool(Some(pool)),
     };
 
-    let response = provider.relay(relay_context()).await;
+    let response = relay_request(&provider).await;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body = axum::body::to_bytes(response.into_body(), 1024)
         .await
@@ -567,7 +626,7 @@ async fn startup_refresh_handles_failures_and_preserves_the_preferred_account() 
     assert!(snapshots[4]["windows"]["5h"].is_null());
     assert_eq!(snapshots[5]["lastResponseStatus"], 503);
 
-    let response = tokio::time::timeout(Duration::from_secs(5), provider.relay(relay_context()))
+    let response = tokio::time::timeout(Duration::from_secs(5), relay_request(&provider))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);

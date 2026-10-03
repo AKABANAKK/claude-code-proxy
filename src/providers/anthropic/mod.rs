@@ -44,12 +44,24 @@ use crate::registry::ANTHROPIC_STYLE_ALIASES;
 ///
 /// Returns rewritten bytes only when something changed; `None` forwards the body
 /// verbatim, keeping the byte-identical cache prefix for pure-Anthropic conversations.
-fn sanitize_anthropic_request(raw: &[u8], req_id: &str) -> Option<Vec<u8>> {
+fn sanitize_anthropic_request(raw: &[u8], body: &MessagesRequest, req_id: &str) -> Option<Vec<u8>> {
+    detect_hosted_web_search_regression(body, req_id);
+
+    // The server already parsed the request. Only parse the original bytes again
+    // when rewriting, so unknown message fields survive and normal requests stay cheap.
+    let needs_rewrite = body.messages.iter().any(|message| {
+        message.role == "assistant"
+            && message
+                .content
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(is_unsigned_thinking))
+    });
+    if !needs_rewrite {
+        return None;
+    }
+
     let mut doc: Value = serde_json::from_slice(raw).ok()?;
     let obj = doc.as_object_mut()?;
-
-    detect_hosted_web_search_regression(obj, req_id);
-
     let messages = obj.get_mut("messages")?.as_array_mut()?;
     let mut changed = false;
     for message in messages.iter_mut() {
@@ -70,25 +82,23 @@ fn sanitize_anthropic_request(raw: &[u8], req_id: &str) -> Option<Vec<u8>> {
 /// Convert one signature-less `thinking` block into a tagged `text` block in place.
 /// Returns whether the block was rewritten.
 fn rehydrate_unsigned_thinking(block: &mut Value) -> bool {
-    let Some(map) = block.as_object() else {
-        return false;
-    };
-    if map.get("type").and_then(Value::as_str) != Some("thinking") {
+    if !is_unsigned_thinking(block) {
         return false;
     }
-    let signed = map
-        .get("signature")
-        .and_then(Value::as_str)
-        .is_some_and(|sig| !sig.is_empty());
-    if signed {
-        return false;
-    }
-    let reasoning = map.get("thinking").and_then(Value::as_str).unwrap_or("");
+    let reasoning = block.get("thinking").and_then(Value::as_str).unwrap_or("");
     *block = serde_json::json!({
         "type": "text",
         "text": wrap_reasoning(reasoning),
     });
     true
+}
+
+fn is_unsigned_thinking(block: &Value) -> bool {
+    let signed = block
+        .get("signature")
+        .and_then(Value::as_str)
+        .is_some_and(|sig| !sig.is_empty());
+    block.get("type").and_then(Value::as_str) == Some("thinking") && !signed
 }
 
 /// Regression tripwire. Claude Code drives its `WebSearch` tool through an isolated,
@@ -97,31 +107,24 @@ fn rehydrate_unsigned_thinking(block: &mut Value) -> bool {
 /// outer transcript. If that ever changes (hosted web search reaching a request that
 /// already carries assistant history), those blocks would ride the transcript across a
 /// model switch and this warning flags it so the assumption can be re-checked.
-fn detect_hosted_web_search_regression(obj: &serde_json::Map<String, Value>, req_id: &str) {
-    let messages = obj.get("messages").and_then(Value::as_array);
-    let has_assistant_history = messages.is_some_and(|ms| {
-        ms.iter()
-            .any(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-    });
-    let hosted_tool = obj
+fn detect_hosted_web_search_regression(body: &MessagesRequest, req_id: &str) {
+    let has_assistant_history = body.messages.iter().any(|m| m.role == "assistant");
+    let hosted_tool = body
+        .extra
         .get("tools")
         .and_then(Value::as_array)
         .is_some_and(|ts| {
             ts.iter()
                 .any(|t| t.get("type").and_then(Value::as_str) == Some("web_search_20250305"))
         });
-    let reconstructed_block = messages.is_some_and(|ms| {
-        ms.iter().any(|m| {
-            m.get("content")
-                .and_then(Value::as_array)
-                .is_some_and(|blocks| {
-                    blocks.iter().any(|b| {
-                        matches!(
-                            b.get("type").and_then(Value::as_str),
-                            Some("server_tool_use") | Some("web_search_tool_result")
-                        )
-                    })
-                })
+    let reconstructed_block = body.messages.iter().any(|m| {
+        m.content.as_array().is_some_and(|blocks| {
+            blocks.iter().any(|b| {
+                matches!(
+                    b.get("type").and_then(Value::as_str),
+                    Some("server_tool_use") | Some("web_search_tool_result")
+                )
+            })
         })
     });
 
@@ -197,7 +200,7 @@ impl AnthropicProvider {
         }
     }
 
-    async fn relay(&self, ctx: RequestContext) -> Response {
+    async fn relay(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let RequestContext {
             req_id,
             traffic,
@@ -228,10 +231,11 @@ impl AnthropicProvider {
 
         // Rehydrate signature-less codex `thinking` blocks so a mid-conversation switch
         // to Anthropic does not 400. Unchanged bodies are forwarded verbatim.
-        let outgoing = match sanitize_anthropic_request(&passthrough.raw_body, &req_id) {
+        let outgoing = match sanitize_anthropic_request(&passthrough.raw_body, &body, &req_id) {
             Some(bytes) => reqwest::Body::from(bytes),
             None => reqwest::Body::from(passthrough.raw_body),
         };
+        drop(body);
 
         let upstream = self
             .accounts
@@ -290,12 +294,12 @@ impl Provider for AnthropicProvider {
         self.accounts.initialize(&self.client, &self.base_url).await;
     }
 
-    async fn handle_messages(&self, _body: MessagesRequest, ctx: RequestContext) -> Response {
-        self.relay(ctx).await
+    async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        self.relay(body, ctx).await
     }
 
-    async fn handle_count_tokens(&self, _body: MessagesRequest, ctx: RequestContext) -> Response {
-        self.relay(ctx).await
+    async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        self.relay(body, ctx).await
     }
 }
 
@@ -366,6 +370,10 @@ mod tests {
         serde_json::from_slice(bytes).unwrap()
     }
 
+    fn parse_request(bytes: &[u8]) -> MessagesRequest {
+        serde_json::from_slice(bytes).unwrap()
+    }
+
     #[test]
     fn unsigned_thinking_becomes_tagged_text() {
         let body = serde_json::json!({
@@ -378,7 +386,8 @@ mod tests {
             ]
         });
         let raw = serde_json::to_vec(&body).unwrap();
-        let out = sanitize_anthropic_request(&raw, "req1").expect("should rewrite");
+        let out =
+            sanitize_anthropic_request(&raw, &parse_request(&raw), "req1").expect("should rewrite");
         let doc = parse(&out);
         let blocks = doc["messages"][1]["content"].as_array().unwrap();
         // the thinking block is gone, replaced by tagged text; the real answer survives
@@ -402,7 +411,7 @@ mod tests {
             ]
         });
         let raw = serde_json::to_vec(&body).unwrap();
-        assert!(sanitize_anthropic_request(&raw, "req2").is_none());
+        assert!(sanitize_anthropic_request(&raw, &parse_request(&raw), "req2").is_none());
     }
 
     #[test]
@@ -415,7 +424,8 @@ mod tests {
             ]
         });
         let raw = serde_json::to_vec(&body).unwrap();
-        let out = sanitize_anthropic_request(&raw, "req3").expect("should rewrite");
+        let out =
+            sanitize_anthropic_request(&raw, &parse_request(&raw), "req3").expect("should rewrite");
         assert_eq!(parse(&out)["messages"][0]["content"][0]["type"], "text");
     }
 
@@ -428,7 +438,7 @@ mod tests {
             ]
         });
         let raw = serde_json::to_vec(&body).unwrap();
-        assert!(sanitize_anthropic_request(&raw, "req4").is_none());
+        assert!(sanitize_anthropic_request(&raw, &parse_request(&raw), "req4").is_none());
     }
 
     #[test]
@@ -441,8 +451,9 @@ mod tests {
             ]
         });
         let raw = serde_json::to_vec(&body).unwrap();
-        let a = sanitize_anthropic_request(&raw, "r").unwrap();
-        let b = sanitize_anthropic_request(&raw, "r").unwrap();
+        let request = parse_request(&raw);
+        let a = sanitize_anthropic_request(&raw, &request, "r").unwrap();
+        let b = sanitize_anthropic_request(&raw, &request, "r").unwrap();
         assert_eq!(
             a, b,
             "rewrite must be byte-stable to preserve the cache prefix"
@@ -451,6 +462,54 @@ mod tests {
 
     #[test]
     fn non_json_body_is_forwarded_verbatim() {
-        assert!(sanitize_anthropic_request(b"not json", "req5").is_none());
+        let request = parse_request(
+            br#"{"messages":[{"role":"assistant","content":[{"type":"thinking"}]}]}"#,
+        );
+        assert!(sanitize_anthropic_request(b"not json", &request, "req5").is_none());
+    }
+
+    #[test]
+    fn rewrite_preserves_unknown_fields_and_handles_escaped_block_types() {
+        let raw = br#"{
+            "model": "claude-original",
+            "unknown_root": {"keep": true},
+            "messages": [
+                {"role": "user", "unknown_message": 1, "content": [
+                    {"type": "thinking", "thinking": "user block stays unchanged"}
+                ]},
+                {"role": "assistant", "unknown_message": {"keep": 2}, "content": [
+                    {"type": "th\u0069nking", "thinking": "reasoning", "signature": ""},
+                    {"type": "thinking", "thinking": "signed", "signature": "sig", "extra": 3},
+                    {"type": "text", "text": "answer", "extra": 4}
+                ]}
+            ]
+        }"#;
+        let mut request = parse_request(raw);
+        request.model = Some("normalized-model".to_string());
+        let mut expected = parse(raw);
+        expected["messages"][1]["content"][0] = serde_json::json!({
+            "type": "text", "text": wrap_reasoning("reasoning")
+        });
+        let output = sanitize_anthropic_request(raw, &request, "escaped").unwrap();
+        assert_eq!(parse(&output), expected);
+    }
+
+    #[test]
+    fn non_string_signatures_are_treated_as_unsigned() {
+        for signature in [Value::Null, Value::Bool(false), serde_json::json!(123)] {
+            let raw = serde_json::to_vec(&serde_json::json!({
+                "messages": [{"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "reasoning", "signature": signature}
+                ]}]
+            }))
+            .unwrap();
+            let out = sanitize_anthropic_request(&raw, &parse_request(&raw), "signature").unwrap();
+            assert_eq!(
+                parse(&out)["messages"][0]["content"][0],
+                serde_json::json!({
+                    "type": "text", "text": wrap_reasoning("reasoning")
+                })
+            );
+        }
     }
 }

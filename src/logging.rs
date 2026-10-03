@@ -51,8 +51,8 @@ fn stderr_suppressed() -> bool {
     STDERR_SUPPRESSION_DEPTH.load(Ordering::Relaxed) > 0
 }
 
-fn should_mirror_to_stderr(level: &str) -> bool {
-    !stderr_suppressed() && (matches!(level, "warn" | "error") || config::log_stderr())
+fn should_mirror_to_stderr(level: &str, log_stderr: bool) -> bool {
+    !stderr_suppressed() && (matches!(level, "warn" | "error") || log_stderr)
 }
 
 #[derive(Clone)]
@@ -88,6 +88,8 @@ impl Logger {
     }
 
     fn emit(&self, level: &str, msg: &str, fields: Option<serde_json::Map<String, Value>>) {
+        // Share one settings snapshot across the whole record, including nested fields.
+        let settings = config::load_config();
         let mut body = serde_json::Map::new();
         body.insert("t".into(), Value::String(now_iso8601()));
         body.insert("level".into(), Value::String(level.to_string()));
@@ -99,12 +101,15 @@ impl Logger {
             merged.extend(fields);
         }
         if !merged.is_empty() {
-            body.insert("fields".into(), redact_value(Value::Object(merged)));
+            body.insert(
+                "fields".into(),
+                redact_with_depth(Value::Object(merged), 0, settings.log_verbose),
+            );
         }
 
         let line = Value::Object(body).to_string();
 
-        let mirror_to_stderr = should_mirror_to_stderr(level);
+        let mirror_to_stderr = should_mirror_to_stderr(level, settings.log_stderr);
         if mirror_to_stderr {
             let _ = writeln!(io::stderr(), "{line}");
         }
@@ -180,20 +185,24 @@ fn now_iso8601() -> String {
 }
 
 pub fn redact_value(value: Value) -> Value {
-    redact_with_depth(value, 0)
+    redact_with_depth(value, 0, config::log_verbose())
 }
 
-fn redact_with_depth(value: Value, depth: u8) -> Value {
+fn redact_with_depth(value: Value, depth: u8, verbose: bool) -> Value {
     if depth > 6 {
         return Value::String("[depth-limit]".into());
     }
 
     match value {
         Value::String(s) => {
-            if config::log_verbose() {
+            if verbose {
                 Value::String(s)
             } else if s.len() > 4000 {
-                Value::String(format!("{}…[{} more]", &s[..4000], s.len() - 4000))
+                let mut end = 4000;
+                while !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                Value::String(format!("{}…[{} more]", &s[..end], s.len() - end))
             } else {
                 Value::String(s)
             }
@@ -201,7 +210,7 @@ fn redact_with_depth(value: Value, depth: u8) -> Value {
         Value::Array(values) => Value::Array(
             values
                 .into_iter()
-                .map(|v| redact_with_depth(v, depth + 1))
+                .map(|v| redact_with_depth(v, depth + 1, verbose))
                 .collect(),
         ),
         Value::Object(fields) => {
@@ -210,7 +219,7 @@ fn redact_with_depth(value: Value, depth: u8) -> Value {
                 if REDACT_KEYS.contains(&key.to_lowercase().as_str()) {
                     out.insert(key, redact_key_redaction(value));
                 } else {
-                    out.insert(key, redact_with_depth(value, depth + 1));
+                    out.insert(key, redact_with_depth(value, depth + 1, verbose));
                 }
             }
             Value::Object(out)
@@ -274,15 +283,17 @@ mod tests {
     #[test]
     fn stderr_suppression_disables_level_mirroring() {
         let _lock = STDERR_TEST_LOCK.lock().unwrap();
-        assert!(should_mirror_to_stderr("warn"));
+        assert!(!should_mirror_to_stderr("info", false));
+        assert!(should_mirror_to_stderr("info", true));
+        assert!(should_mirror_to_stderr("warn", false));
 
         {
             let _guard = suppress_stderr();
-            assert!(!should_mirror_to_stderr("warn"));
-            assert!(!should_mirror_to_stderr("error"));
+            assert!(!should_mirror_to_stderr("warn", false));
+            assert!(!should_mirror_to_stderr("error", true));
         }
 
-        assert!(should_mirror_to_stderr("warn"));
+        assert!(should_mirror_to_stderr("warn", false));
     }
 
     #[test]
@@ -290,13 +301,13 @@ mod tests {
         let _lock = STDERR_TEST_LOCK.lock().unwrap();
         let outer = suppress_stderr();
         let inner = suppress_stderr();
-        assert!(!should_mirror_to_stderr("warn"));
+        assert!(!should_mirror_to_stderr("warn", false));
 
         drop(inner);
-        assert!(!should_mirror_to_stderr("warn"));
+        assert!(!should_mirror_to_stderr("warn", false));
 
         drop(outer);
-        assert!(should_mirror_to_stderr("warn"));
+        assert!(should_mirror_to_stderr("warn", false));
     }
 
     #[test]
@@ -308,5 +319,38 @@ mod tests {
 
         assert_eq!(redacted["safe"], "kept");
         assert_eq!(redacted["Proxy-Authorization"], "[redacted len=18]");
+    }
+
+    #[test]
+    fn truncation_preserves_utf8_and_reports_omitted_bytes() {
+        for (text, prefix, omitted) in [
+            ("a".repeat(4200), "a".repeat(4000), 200),
+            ("あ".repeat(1400), "あ".repeat(1333), 201),
+            (
+                format!("a{}", "🙂".repeat(1050)),
+                format!("a{}", "🙂".repeat(999)),
+                204,
+            ),
+        ] {
+            assert_eq!(
+                redact_with_depth(Value::String(text), 0, false),
+                Value::String(format!("{prefix}…[{omitted} more]")),
+            );
+        }
+    }
+
+    #[test]
+    fn verbosity_applies_to_nested_values_without_disabling_secret_redaction() {
+        let text = "あ".repeat(1400);
+        let value = serde_json::json!({"nested": [{"text": text, "Authorization": "secret"}]});
+        let verbose = redact_with_depth(value.clone(), 0, true);
+        let normal = redact_with_depth(value, 0, false);
+        assert_eq!(verbose["nested"][0]["text"], text);
+        assert_eq!(
+            normal["nested"][0]["text"],
+            format!("{}…[201 more]", "あ".repeat(1333))
+        );
+        assert_eq!(verbose["nested"][0]["Authorization"], "[redacted len=6]");
+        assert_eq!(normal["nested"][0]["Authorization"], "[redacted len=6]");
     }
 }
