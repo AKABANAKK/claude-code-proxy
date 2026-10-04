@@ -150,10 +150,6 @@ async fn relay_through_mock_with_usage_directory(
     });
 
     let provider = AnthropicProvider {
-        client: reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap(),
         base_url: format!("http://{addr}"),
         accounts: match usage_directory {
             Some(directory) => AccountRelay::with_usage_directory(pool, directory),
@@ -179,6 +175,158 @@ fn response_statuses(responses: &[Response]) -> Vec<StatusCode> {
     responses.iter().map(Response::status).collect()
 }
 
+/// Keep-alive remains enabled so a shared client would reuse a connection.
+async fn persistent_upstream(
+    reject_first: bool,
+) -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<std::net::SocketAddr>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::extract::ConnectInfo;
+    use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (sent, received) = tokio::sync::mpsc::unbounded_channel();
+    let reject = Arc::new(AtomicBool::new(reject_first));
+    let app = axum::Router::new().fallback(axum::routing::post(
+        move |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>, _body: axum::body::Bytes| {
+            let sent = sent.clone();
+            let reject = reject.clone();
+            async move {
+                sent.send(peer).unwrap();
+                if reject.swap(false, Ordering::Relaxed) {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::OK
+                }
+            }
+        },
+    ));
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    (base_url, received, server)
+}
+
+#[tokio::test]
+async fn relays_use_separate_connections_with_and_without_registered_accounts() {
+    for pool in [None, Some(registered_pool())] {
+        let (base_url, mut peers, server) = persistent_upstream(false).await;
+        let provider = AnthropicProvider {
+            base_url,
+            accounts: AccountRelay::with_pool(pool),
+        };
+        let mut connections = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let response = tokio::time::timeout(Duration::from_secs(5), relay_request(&provider))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert!(
+                connections.insert(peers.try_recv().unwrap()),
+                "a completed request's connection must not be reused"
+            );
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn account_retry_uses_a_separate_connection() {
+    let (base_url, mut peers, server) = persistent_upstream(true).await;
+    let provider = AnthropicProvider {
+        base_url,
+        accounts: AccountRelay::with_pool(Some(two_account_pool())),
+    };
+    let response = tokio::time::timeout(Duration::from_secs(5), relay_request(&provider))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_ne!(peers.try_recv().unwrap(), peers.try_recv().unwrap());
+    server.abort();
+}
+
+#[tokio::test]
+async fn startup_probes_and_subsequent_relay_use_separate_connections() {
+    let (base_url, mut peers, server) = persistent_upstream(false).await;
+    let pool = AccountPool::new(
+        (1..=6)
+            .map(|index| PoolAccount {
+                name: format!("test-{index}"),
+                token: format!("test-token-{index}"),
+            })
+            .collect(),
+        0.98,
+        None,
+    );
+    let provider = AnthropicProvider {
+        base_url,
+        accounts: AccountRelay::with_pool(Some(pool)),
+    };
+    tokio::time::timeout(Duration::from_secs(5), provider.initialize())
+        .await
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(5), relay_request(&provider))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let connections: std::collections::HashSet<_> =
+        (0..7).map(|_| peers.try_recv().unwrap()).collect();
+    assert_eq!(connections.len(), 7);
+    server.abort();
+}
+
+#[tokio::test]
+async fn response_keeps_streaming_after_its_request_client_is_dropped() {
+    use futures_util::StreamExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (finish, finished) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        read_http_request(&mut connection).await;
+        connection
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\nC\r\ndata: ping\n\n\r\n")
+            .await
+            .unwrap();
+        finished.await.unwrap();
+        connection
+            .write_all(b"C\r\ndata: done\n\n\r\n0\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let provider = AnthropicProvider {
+        base_url,
+        accounts: AccountRelay::with_pool(None),
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let response = relay_request(&provider).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        assert_eq!(stream.next().await.unwrap().unwrap(), "data: ping\n\n");
+        finish.send(()).unwrap();
+        let mut tail = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            tail.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(tail, b"data: done\n\n");
+        server.await.unwrap();
+    })
+    .await
+    .expect("the response must stream before and after the client is dropped");
+}
+
 #[tokio::test]
 async fn message_and_count_tokens_relays_preserve_original_body_bytes() {
     // Whitespace, escaped keys and unknown message fields must all survive the fast path.
@@ -197,7 +345,6 @@ async fn message_and_count_tokens_relays_preserve_original_body_bytes() {
             request
         });
         let provider = AnthropicProvider {
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
             base_url: format!("http://{addr}"),
             accounts: AccountRelay::with_pool(None),
         };
@@ -427,7 +574,6 @@ async fn relay_preserves_streaming_response_after_switching_accounts() {
 async fn malformed_upstream_url_remains_a_bad_gateway_with_or_without_accounts() {
     for pool in [None, Some(two_account_pool())] {
         let provider = AnthropicProvider {
-            client: reqwest::Client::new(),
             base_url: "://invalid".to_string(),
             accounts: AccountRelay::with_pool(pool),
         };
@@ -450,7 +596,6 @@ async fn invalid_token_is_reported_without_exposing_it() {
         None,
     );
     let provider = AnthropicProvider {
-        client: reqwest::Client::new(),
         base_url: "http://127.0.0.1:1".to_string(),
         accounts: AccountRelay::with_pool(Some(pool)),
     };
@@ -595,11 +740,6 @@ async fn startup_refresh_handles_failures_and_preserves_the_preferred_account() 
         requests
     });
     let provider = AnthropicProvider {
-        client: reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap(),
         base_url,
         accounts: AccountRelay::with_usage_directory(Some(pool), directory.path().to_path_buf()),
     };
@@ -654,8 +794,6 @@ async fn startup_refresh_handles_failures_and_preserves_the_preferred_account() 
 async fn startup_without_registered_accounts_does_not_contact_upstream() {
     let directory = tempfile::TempDir::new().unwrap();
     let relay = AccountRelay::with_usage_directory(None, directory.path().join("usage"));
-    relay
-        .initialize(&reqwest::Client::new(), "not-a-valid-upstream-url")
-        .await;
+    relay.initialize("not-a-valid-upstream-url").await;
     assert!(!directory.path().join("usage").exists());
 }

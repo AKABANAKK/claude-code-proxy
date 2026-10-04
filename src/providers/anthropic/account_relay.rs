@@ -1,5 +1,6 @@
 //! Account selection, bounded retries, and usage logging around an upstream request.
 
+use std::error::Error;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -11,7 +12,7 @@ use serde_json::Value;
 
 use super::account_usage::UsageFiles;
 use super::pool::{AccountPool, AccountUse, BlockReason, PoolAccount, PoolEvent, Selection};
-use super::{accounts, ratelimit};
+use super::{accounts, new_upstream_client, ratelimit};
 use crate::anthropic::error::json_error;
 use crate::logging::{Logger, create_logger};
 use crate::traffic::TrafficCapture;
@@ -48,7 +49,7 @@ impl AccountRelay {
         relay
     }
 
-    pub(super) async fn initialize(&self, client: &reqwest::Client, base_url: &str) {
+    pub(super) async fn initialize(&self, base_url: &str) {
         let Some(pool) = &self.pool else {
             return;
         };
@@ -72,7 +73,7 @@ impl AccountRelay {
         let mut probes = stream::iter(targets)
             .map(|selection| async move {
                 let started = Instant::now();
-                let response = probe_account(client, base_url, &selection.account.token).await;
+                let response = probe_account(base_url, &selection.account.token).await;
                 (selection, response, started.elapsed())
             })
             .buffer_unordered(STARTUP_PROBE_CONCURRENCY);
@@ -112,10 +113,7 @@ impl AccountRelay {
                 }
                 Err(err) => {
                     failures += 1;
-                    fields.insert(
-                        "error".into(),
-                        serde_json::json!(err.without_url().to_string()),
-                    );
+                    fields.extend(upstream_error_details(err).1);
                     log.warn("anthropic_account_usage_refresh_failed", Some(fields));
                 }
             }
@@ -146,10 +144,10 @@ impl AccountRelay {
         req_id: &str,
         traffic: Option<&TrafficCapture>,
     ) -> Result<reqwest::Response, Response> {
-        let (client, request) = builder.build_split();
-        let request = request.map_err(upstream_error)?;
+        let (mut client, request) = builder.build_split();
+        let request = request.map_err(|err| upstream_error(err, req_id, None, Duration::ZERO))?;
         let Some(pool) = &self.pool else {
-            return send_upstream(&client, request, traffic).await;
+            return send_upstream(&client, request, req_id, None, traffic).await;
         };
         let log = create_logger("anthropic");
         let mut tried_accounts = Vec::new();
@@ -182,7 +180,21 @@ impl AccountRelay {
                 log_account_use(&log, req_id, &selection, &pool, now);
             }
             attempt.headers_mut().insert(AUTHORIZATION, authorization);
-            let upstream = send_upstream(&client, attempt, traffic).await?;
+            if !tried_accounts.is_empty() {
+                // Account failover is another upstream attempt; do not reuse
+                // the connection that returned 429 for the previous account.
+                client = new_upstream_client().map_err(|err| {
+                    upstream_error(err, req_id, Some(&selection.account.name), Duration::ZERO)
+                })?;
+            }
+            let upstream = send_upstream(
+                &client,
+                attempt,
+                req_id,
+                Some(&selection.account.name),
+                traffic,
+            )
+            .await?;
             let status = upstream.status();
             let observation = ratelimit::observe(upstream.headers());
             let (events, counts) = {
@@ -206,19 +218,15 @@ impl AccountRelay {
         }
         match rejected {
             Some(upstream) => Ok(upstream),
-            None => send_upstream(&client, request, traffic).await,
+            None => send_upstream(&client, request, req_id, None, traffic).await,
         }
     }
 }
 
-async fn probe_account(
-    client: &reqwest::Client,
-    base_url: &str,
-    token: &str,
-) -> Result<reqwest::Response, reqwest::Error> {
+async fn probe_account(base_url: &str, token: &str) -> Result<reqwest::Response, reqwest::Error> {
     // setup-token credentials support model requests. Fable responses include
     // the 7d_oi window, which an Opus-only request may omit.
-    client
+    new_upstream_client()?
         .post(format!(
             "{}/v1/messages?beta=true",
             base_url.trim_end_matches('/')
@@ -246,10 +254,15 @@ async fn probe_account(
 async fn send_upstream(
     client: &reqwest::Client,
     request: reqwest::Request,
+    req_id: &str,
+    account: Option<&str>,
     traffic: Option<&TrafficCapture>,
 ) -> Result<reqwest::Response, Response> {
     let started = Instant::now();
-    let upstream = client.execute(request).await.map_err(upstream_error)?;
+    let upstream = client
+        .execute(request)
+        .await
+        .map_err(|err| upstream_error(err, req_id, account, started.elapsed()))?;
     if let Some(traffic) = traffic {
         write_upstream_response_headers(traffic, &upstream, started.elapsed());
     }
@@ -338,12 +351,64 @@ fn select_account(pool: &Mutex<AccountPool>, tried_accounts: &[String]) -> Optio
     lock_pool(pool).select(now_unix_secs(), tried_accounts)
 }
 
-fn upstream_error(err: reqwest::Error) -> Response {
+pub(super) fn upstream_error(
+    err: reqwest::Error,
+    req_id: &str,
+    account: Option<&str>,
+    elapsed: Duration,
+) -> Response {
+    let (message, mut fields) = upstream_error_details(err);
+    fields.extend([
+        ("reqId".into(), serde_json::json!(req_id)),
+        ("account".into(), serde_json::json!(account)),
+        ("ms".into(), serde_json::json!(elapsed.as_millis())),
+    ]);
+    create_logger("anthropic").warn("anthropic_upstream_request_failed", Some(fields));
     json_error(
         StatusCode::BAD_GATEWAY,
         "api_error",
-        format!("anthropic upstream request failed: {err}"),
+        format!("anthropic upstream request failed: {message}"),
     )
+}
+
+fn upstream_error_details(err: reqwest::Error) -> (String, serde_json::Map<String, Value>) {
+    // Only retain the origin: URLs may carry credentials in userinfo, paths,
+    // or query parameters. Never format the request, its headers, or its body.
+    let upstream = err.url().map(|url| url.origin().ascii_serialization());
+    let err = err.without_url();
+    let message = err.to_string();
+    let phase = if err.is_builder() {
+        "build"
+    } else if err.is_connect() {
+        "connect"
+    } else {
+        // execute() covers sending the request and waiting for response headers.
+        "send"
+    };
+    let mut chain = vec![message.clone()];
+    let mut io_kind = None;
+    let mut os_error = None;
+    let mut source = err.source();
+    while let Some(cause) = source {
+        chain.push(cause.to_string());
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            io_kind = Some(format!("{:?}", io.kind()));
+            os_error = io.raw_os_error();
+        }
+        source = cause.source();
+    }
+    let fields = serde_json::Map::from_iter([
+        ("error".into(), serde_json::json!(message)),
+        ("rootCause".into(), serde_json::json!(chain.last())),
+        ("errorChain".into(), serde_json::json!(chain)),
+        ("phase".into(), serde_json::json!(phase)),
+        ("isConnect".into(), serde_json::json!(err.is_connect())),
+        ("isTimeout".into(), serde_json::json!(err.is_timeout())),
+        ("ioKind".into(), serde_json::json!(io_kind)),
+        ("osError".into(), serde_json::json!(os_error)),
+        ("upstream".into(), serde_json::json!(upstream)),
+    ]);
+    (message, fields)
 }
 
 fn log_account_use(
@@ -487,6 +552,79 @@ fn log_pool_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn upstream_connection_failure_reports_os_cause_without_secrets() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let err = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .post(format!(
+                "http://secret-user:secret-password@{address}/secret-path?token=secret-query#secret-fragment"
+            ))
+            .bearer_auth("secret-authorization")
+            .body("secret-body")
+            .send()
+            .await
+            .unwrap_err();
+        let (message, fields) = upstream_error_details(err);
+        assert_eq!(fields["phase"], "connect");
+        assert_eq!(fields["isConnect"], true);
+        assert_eq!(fields["isTimeout"], false);
+        assert_eq!(fields["ioKind"], "ConnectionRefused");
+        assert!(fields["osError"].is_number());
+        assert_eq!(fields["upstream"], format!("http://{address}"));
+        assert!(fields["errorChain"].as_array().unwrap().len() > 1);
+        assert_ne!(fields["rootCause"], message);
+        assert!(!message.contains("secret-"));
+        assert!(!serde_json::to_string(&fields).unwrap().contains("secret-"));
+    }
+
+    #[tokio::test]
+    async fn upstream_header_timeout_is_distinguished_from_connection_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let (accepted, response) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                listener.accept(),
+                client
+                    .get(format!("http://{}", listener.local_addr().unwrap()))
+                    .send(),
+            )
+        })
+        .await
+        .expect("the local timeout probe must finish");
+        // Keep the accepted connection open without returning response headers.
+        let (_connection, _) = accepted.unwrap();
+        let (_, fields) = upstream_error_details(response.unwrap_err());
+        assert_eq!(fields["phase"], "send");
+        assert_eq!(fields["isConnect"], false);
+        assert_eq!(fields["isTimeout"], true);
+        assert_eq!(fields["rootCause"], "operation timed out");
+    }
+
+    #[test]
+    fn upstream_invalid_header_reports_build_failure_without_header_value() {
+        let err = reqwest::Client::new()
+            .get("http://localhost/")
+            .header(AUTHORIZATION, "secret-invalid-header\n")
+            .build()
+            .unwrap_err();
+        let (_, fields) = upstream_error_details(err);
+        assert_eq!(fields["phase"], "build");
+        assert_eq!(fields["isConnect"], false);
+        assert_eq!(fields["isTimeout"], false);
+        assert!(fields["errorChain"].as_array().unwrap().len() > 1);
+        assert!(!serde_json::to_string(&fields).unwrap().contains("secret-"));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn slow_usage_disk_does_not_delay_failover_or_streaming() {

@@ -140,6 +140,28 @@ Kimi stores a persistent UUID at `<configuration-root>/kimi/device_id` for file-
 
 `proxy.log` lives under the state root. It uses JSON Lines and rotates at 20 MiB. Known credential keys, including authorization, access tokens, refresh tokens, ID tokens, and account headers, are redacted before writing.
 
+Anthropic transport failures that produce a proxy 502 also emit
+`anthropic_upstream_request_failed` at warning level. The event contains:
+
+- `reqId`, `account`, and `ms`: the request, selected account, and elapsed time for
+  the failed attempt. `account` is `null` when using incoming credentials or when
+  building the request fails before account selection.
+- `errorChain` and `rootCause`: the error and its nested causes, including the
+  underlying DNS, TLS, connection, or protocol error when available.
+- `phase`: `build`, `connect` (including DNS and TLS), or `send` (the overall
+  request through response headers when the client cannot identify a more
+  specific phase). `isConnect` and `isTimeout` provide the HTTP client's
+  classifications without guessing from error text.
+- `ioKind` and `osError`: the I/O error kind and OS error code, when available.
+- `upstream`: the upstream origin, without URL credentials, path, query, or
+  fragment. Request headers and bodies are not included in this event.
+
+Startup transport failures include the same error details in
+`anthropic_account_usage_refresh_failed`. These events are written with the
+normal logging settings; traffic capture and verbose logging are not required.
+Use `reqId` to correlate a relay failure with `request_completed` and
+`request_failed` in the same file.
+
 A Homebrew service also writes `service.log` under the state root.
 
 ## Failed responses

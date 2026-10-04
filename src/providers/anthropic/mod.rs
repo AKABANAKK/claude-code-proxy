@@ -182,19 +182,21 @@ fn is_stripped_response_header(name: &str) -> bool {
 }
 
 pub struct AnthropicProvider {
-    client: reqwest::Client,
     base_url: String,
     accounts: account_relay::AccountRelay,
 }
 
+fn new_upstream_client() -> Result<reqwest::Client, reqwest::Error> {
+    // Each upstream attempt owns its client so separate requests never share
+    // a pooled connection, including concurrent HTTP/2 streams.
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 impl AnthropicProvider {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("failed to build anthropic passthrough client");
         Self {
-            client,
             base_url: crate::config::anthropic_base_url(),
             accounts: account_relay::AccountRelay::new(),
         }
@@ -237,10 +239,21 @@ impl AnthropicProvider {
         };
         drop(body);
 
+        let client = match new_upstream_client() {
+            Ok(client) => client,
+            Err(err) => {
+                return account_relay::upstream_error(
+                    err,
+                    &req_id,
+                    None,
+                    std::time::Duration::ZERO,
+                );
+            }
+        };
         let upstream = self
             .accounts
             .send(
-                self.client.post(&url).headers(headers).body(outgoing),
+                client.post(&url).headers(headers).body(outgoing),
                 &req_id,
                 traffic.as_deref(),
             )
@@ -291,7 +304,7 @@ impl Provider for AnthropicProvider {
     }
 
     async fn initialize(&self) {
-        self.accounts.initialize(&self.client, &self.base_url).await;
+        self.accounts.initialize(&self.base_url).await;
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
