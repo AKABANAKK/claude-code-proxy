@@ -3,6 +3,14 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## v0.1.44 (2026-10-07)
+
+- Codex requests that repeatedly produce no output now fail after the proxy's
+  retries, instead of Claude Code retrying them again and hanging for up to
+  half an hour.
+  ([#174](https://github.com/raine/claude-code-proxy/issues/174),
+  [#175](https://github.com/raine/claude-code-proxy/pull/175))
+
 ## v0.1.43 (2026-09-30)
 
 - Codex users can select GPT-6.1 Sol with `gpt-6.1-sol` or its
