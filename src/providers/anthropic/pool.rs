@@ -56,7 +56,7 @@ impl AccountState {
         self.blocked_until = Some(later);
     }
 
-    fn usage_snapshot(&self, now: u64, threshold: f64) -> Value {
+    fn usage_snapshot(&self, now: u64, threshold: f64, active: bool) -> Value {
         let windows: serde_json::Map<String, Value> = WATCHED_WINDOWS
             .into_iter()
             .map(|window| {
@@ -70,6 +70,7 @@ impl AccountState {
             .collect();
         json!({
             "account": self.account.name,
+            "active": active,
             "asOf": timestamp(now),
             "asOfUnixSecs": now,
             "lastResponseAt": self.last_response_at.and_then(timestamp),
@@ -266,16 +267,20 @@ impl AccountPool {
     }
 
     pub(super) fn usage_snapshots(&self, now: u64) -> impl Iterator<Item = (&str, Value)> {
-        self.accounts.iter().map(move |state| {
+        self.accounts.iter().enumerate().map(move |(index, state)| {
             (
                 state.account.name.as_str(),
-                state.usage_snapshot(now, self.threshold),
+                state.usage_snapshot(now, self.threshold, self.last_used == Some(index)),
             )
         })
     }
 
     pub(super) fn usage_snapshot(&self, selection: &Selection, now: u64) -> Value {
-        self.accounts[selection.index].usage_snapshot(now, self.threshold)
+        self.accounts[selection.index].usage_snapshot(
+            now,
+            self.threshold,
+            self.last_used == Some(selection.index),
+        )
     }
 
     pub(super) fn count_fields(&self, now: u64) -> serde_json::Map<String, Value> {
@@ -810,6 +815,38 @@ mod tests {
         );
         assert!(snapshot["windows"]["7d_oi"].is_null());
         assert!(!snapshot.to_string().contains("sk-ant-oat"));
+    }
+
+    #[test]
+    fn snapshots_track_selection_without_reactivating_a_late_response() {
+        let mut pool = pool_of(&["first", "second"], None);
+        for (_, snapshot) in pool.usage_snapshots(NOW_UNIX_SECS) {
+            assert_eq!(snapshot["active"], false);
+        }
+        let first = pool.select(NOW_UNIX_SECS, &[]).unwrap();
+        assert_eq!(pool.usage_snapshot(&first, NOW_UNIX_SECS)["active"], true);
+        pool.observe(
+            &first,
+            StatusCode::TOO_MANY_REQUESTS,
+            &RateLimitObservation::default(),
+            NOW_UNIX_SECS,
+        );
+        let second = pool.select(NOW_UNIX_SECS, &[]).unwrap();
+        assert_eq!(second.account.name, "second");
+        pool.observe(
+            &first,
+            StatusCode::OK,
+            &RateLimitObservation::default(),
+            NOW_UNIX_SECS + 1,
+        );
+        assert_eq!(
+            pool.usage_snapshot(&first, NOW_UNIX_SECS + 1)["active"],
+            false
+        );
+        assert_eq!(
+            pool.usage_snapshot(&second, NOW_UNIX_SECS + 1)["active"],
+            true
+        );
     }
 
     #[test]

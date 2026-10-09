@@ -627,6 +627,7 @@ async fn relay_saves_account_usage_and_unknown_windows_without_tokens() {
     let first_text = std::fs::read_to_string(directory.path().join("test-first.json")).unwrap();
     let first: serde_json::Value = serde_json::from_str(&first_text).unwrap();
     assert_eq!(first["account"], FIRST_ACCOUNT_NAME);
+    assert_eq!(first["active"], false);
     assert_eq!(first["windows"]["5h"]["utilization"], 1.0);
     assert_eq!(first["windows"]["5h"]["resetAt"], "2100-01-01T00:00:00Z");
     assert_eq!(first["windows"]["5h"]["resetAtUnixSecs"], 4102444800_u64);
@@ -638,6 +639,7 @@ async fn relay_saves_account_usage_and_unknown_windows_without_tokens() {
         serde_json::from_slice(&std::fs::read(directory.path().join("test-second.json")).unwrap())
             .unwrap();
     assert_eq!(second["lastResponseStatus"], 200);
+    assert_eq!(second["active"], true);
     assert!(second["windows"]["5h"].is_null());
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
 }

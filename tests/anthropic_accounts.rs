@@ -54,7 +54,214 @@ fn anthropic_accounts_command(
     cmd.args(["anthropic", "accounts"]);
     cmd.args(args);
     cmd.env("CCP_CONFIG_DIR", config_dir.path());
+    cmd.env("XDG_STATE_HOME", config_dir.path());
+    cmd.env("LOCALAPPDATA", config_dir.path());
     Ok(cmd)
+}
+
+fn register_list_fixture(config: &TempDir, names: &[&str]) {
+    let directory = config.path().join("anthropic");
+    std::fs::create_dir_all(&directory).unwrap();
+    let accounts: Vec<_> = names
+        .iter()
+        .map(|name| serde_json::json!({"name": name, "token": "private-test-token", "addedAt": 0}))
+        .collect();
+    std::fs::write(
+        directory.join("accounts.json"),
+        serde_json::to_vec(&serde_json::json!({"accounts": accounts})).unwrap(),
+    )
+    .unwrap();
+}
+
+fn list_usage_directory(config: &TempDir) -> std::path::PathBuf {
+    config.path().join("claude-code-proxy/anthropic/accounts")
+}
+
+fn write_list_usage(config: &TempDir, name: &str, snapshot: serde_json::Value) {
+    let directory = list_usage_directory(config);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join(format!("{name}.json")),
+        serde_json::to_vec(&snapshot).unwrap(),
+    )
+    .unwrap();
+}
+
+fn list_output(config: &TempDir) -> String {
+    let output = anthropic_accounts_command(config, &["list"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("private-test-token"));
+    stdout
+}
+
+fn listed_account<'a>(output: &'a str, name: &str) -> &'a str {
+    output
+        .lines()
+        .find(|line| line.contains(&format!(". {name}  [")))
+        .unwrap()
+}
+
+#[test]
+fn list_shows_selection_reset_wait_and_remaining_usage_percentages() {
+    let config = TempDir::new().unwrap();
+    register_list_fixture(&config, &["current", "waiting", "spare", "unknown"]);
+    write_list_usage(
+        &config,
+        "current",
+        serde_json::json!({
+            "account": "current", "active": true, "eligible": true,
+            "windows": {
+                "5h": {"utilization": 0.1234},
+                "7d": {"utilization": 0.5678},
+                "7d_oi": {"utilization": 0.07}
+            }
+        }),
+    );
+    write_list_usage(
+        &config,
+        "waiting",
+        serde_json::json!({
+            "account": "waiting", "active": true, "eligible": false,
+            "blockedUntilUnixSecs": 4102444800_u64,
+            "windows": {"5h": {"utilization": 1.01}, "7d": {"utilization": 0.3}}
+        }),
+    );
+    write_list_usage(
+        &config,
+        "spare",
+        serde_json::json!({
+            "account": "spare", "active": false, "eligible": true,
+            "windows": {"5h": {"utilization": 0.4}, "7d": {"utilization": 0.8}}
+        }),
+    );
+
+    let stdout = list_output(&config);
+    let current = listed_account(&stdout, "current");
+    assert!(current.contains("[稼働中]"));
+    assert!(current.contains("5h: 12.3%  7d: 56.8%  7d_oi: 7.0%"));
+    let waiting = listed_account(&stdout, "waiting");
+    assert!(waiting.contains("[リセット待ち]"));
+    assert!(waiting.contains("5h: 101.0%"));
+    let spare = listed_account(&stdout, "spare");
+    assert!(spare.contains("[残あり]"));
+    assert!(spare.contains("5h: 40.0%  7d: 80.0%  7d_oi: --"));
+    let unknown = listed_account(&stdout, "unknown");
+    assert!(unknown.contains("[未確認]"));
+    assert!(unknown.contains("5h: --  7d: --  7d_oi: --"));
+}
+
+#[test]
+fn list_reads_legacy_selection_and_does_not_override_explicit_inactive_state() {
+    let config = TempDir::new().unwrap();
+    register_list_fixture(&config, &["legacy"]);
+    let snapshot = serde_json::json!({
+        "account": "legacy", "eligible": true, "windows": {"5h": {"utilization": 0.4}}
+    });
+    write_list_usage(&config, "legacy", snapshot.clone());
+    let log = config.path().join("claude-code-proxy/proxy.log");
+    let selected = serde_json::json!({
+        "service": "anthropic", "msg": "anthropic_account_selected",
+        "fields": {"account": "legacy"}
+    });
+    let unrelated = serde_json::json!({
+        "service": "anthropic", "msg": "anthropic_account_selected",
+        "fields": {"account": "unregistered"}
+    });
+    let other_pool = serde_json::json!({
+        "service": "anthropic", "msg": "anthropic_accounts_refresh_started",
+        "fields": {"loadedAccountCount": 2}
+    });
+    std::fs::write(
+        &log,
+        format!("invalid log line\n{selected}\n{unrelated}\n{other_pool}\n"),
+    )
+    .unwrap();
+    assert!(listed_account(&list_output(&config), "legacy").contains("[稼働中]"));
+
+    let mut inactive = snapshot.clone();
+    inactive["active"] = serde_json::json!(false);
+    write_list_usage(&config, "legacy", inactive);
+    assert!(listed_account(&list_output(&config), "legacy").contains("[残あり]"));
+
+    write_list_usage(&config, "legacy", snapshot);
+    let startup = serde_json::json!({
+        "service": "anthropic", "msg": "anthropic_accounts_refresh_started"
+    });
+    std::fs::write(&log, format!("{selected}\n{startup}\n")).unwrap();
+    assert!(listed_account(&list_output(&config), "legacy").contains("[残あり]"));
+}
+
+#[test]
+fn list_expires_blocks_preserves_old_usage_and_identifies_invalid_credentials() {
+    let config = TempDir::new().unwrap();
+    register_list_fixture(&config, &["recovered", "invalid", "old"]);
+    write_list_usage(
+        &config,
+        "recovered",
+        serde_json::json!({
+            "account": "recovered", "active": false, "eligible": false,
+            "blockedUntilUnixSecs": 1,
+            "windows": {
+                "5h": {"utilization": 1.0, "resetAtUnixSecs": 1},
+                "7d": {"utilization": 0.4, "resetAtUnixSecs": 4102444800_u64}
+            }
+        }),
+    );
+    write_list_usage(
+        &config,
+        "invalid",
+        serde_json::json!({"account": "invalid", "active": true, "invalid": true}),
+    );
+    write_list_usage(
+        &config,
+        "old",
+        serde_json::json!({
+            "account": "old", "active": false,
+            "windows": {"5h": {"utilization": 0.2, "resetAtUnixSecs": 1}}
+        }),
+    );
+
+    let stdout = list_output(&config);
+    let recovered = listed_account(&stdout, "recovered");
+    assert!(recovered.contains("[残あり]"));
+    assert!(recovered.contains("5h: 100.0%*  7d: 40.0%"));
+    assert!(listed_account(&stdout, "invalid").contains("[認証無効]"));
+    assert!(listed_account(&stdout, "old").contains("[未確認]"));
+    assert!(stdout.contains("* はリセット時刻経過後の前回値"));
+}
+
+#[test]
+fn list_does_not_use_corrupt_or_mismatched_account_usage() {
+    let config = TempDir::new().unwrap();
+    register_list_fixture(&config, &["corrupt", "mismatched", "spare"]);
+    write_list_usage(
+        &config,
+        "mismatched",
+        serde_json::json!({"account": "other"}),
+    );
+    std::fs::write(
+        list_usage_directory(&config).join("corrupt.json"),
+        "{broken",
+    )
+    .unwrap();
+    write_list_usage(
+        &config,
+        "spare",
+        serde_json::json!({
+            "account": "spare", "active": false, "windows": {"5h": {"utilization": 0.0}}
+        }),
+    );
+    let stdout = list_output(&config);
+    for name in ["corrupt", "mismatched"] {
+        let row = listed_account(&stdout, name);
+        assert!(row.contains("[未確認]"));
+        assert!(row.contains("5h: --  7d: --  7d_oi: --"));
+    }
+    assert!(listed_account(&stdout, "spare").contains("[残あり]  5h: 0.0%"));
 }
 
 #[test]
@@ -140,6 +347,7 @@ fn read_only_commands_do_not_create_or_overwrite_usage_snapshots() {
             vec!["models"],
             vec!["models", "--full"],
             vec!["kimi", "auth", "status"],
+            vec!["anthropic", "accounts", "list"],
         ] {
             let output = Command::cargo_bin("claude-code-proxy")
                 .unwrap()

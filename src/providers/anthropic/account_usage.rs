@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 
+use anyhow::Context;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
@@ -59,6 +60,25 @@ impl UsageFiles {
             directory,
             writer: OnceLock::new(),
         }
+    }
+
+    pub fn read(&self, account: &str) -> anyhow::Result<Option<Value>> {
+        let path = self.directory.join(filename(account));
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err).with_context(|| format!("Cannot read {}", path.display()));
+            }
+        };
+        let snapshot: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Invalid account usage snapshot: {}", path.display()))?;
+        anyhow::ensure!(
+            snapshot["account"].as_str() == Some(account),
+            "Account name does not match usage snapshot: {}",
+            path.display()
+        );
+        Ok(Some(snapshot))
     }
 
     /// Call while holding the pool lock to preserve observation order. Only the
@@ -281,6 +301,19 @@ fn filename(account: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_uses_the_encoded_filename_without_starting_a_writer() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let account = "../Work Account";
+        let snapshot = json!({"account": account, "windows": {"5h": {"utilization": 0.4}}});
+        write_snapshot(directory.path(), account, &snapshot).unwrap();
+        let files = UsageFiles::new(directory.path().to_path_buf());
+        assert_eq!(files.read(account).unwrap(), Some(snapshot));
+        assert_eq!(files.read("missing").unwrap(), None);
+        assert!(files.writer.get().is_none());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn filenames_cannot_escape_or_alias_other_accounts() {

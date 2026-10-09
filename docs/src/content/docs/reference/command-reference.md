@@ -95,8 +95,14 @@ claude-code-proxy anthropic accounts remove <name>
 ```
 
 `add` prompts for one token on standard input; the token is not a command-line
-argument. Names must be nonempty and unique. `list` shows names and registration
-dates in switching order, without tokens. `remove` deletes the named local
+argument. Names must be nonempty and unique. `list` shows names, registration
+dates, the last observed selection status, and usage percentages for `5h`, `7d`,
+and `7d_oi` in switching order. Status labels are `稼働中` (selected),
+`リセット待ち` (blocked until recovery), and `残あり` (available with observed usage).
+Unobserved accounts show `未確認`, and invalid credentials show `認証無効`.
+Usage comes from the proxy's saved observations: `--` means unknown, and `*`
+marks a previous value whose reset time has passed. Listing accounts makes no
+upstream requests and never prints tokens. `remove` deletes the named local
 registration without revoking its upstream token. Successful commands, including
 an empty `list`, exit with status 0. Empty names or tokens, duplicate names, and
 removing an unknown name exit with status 2.

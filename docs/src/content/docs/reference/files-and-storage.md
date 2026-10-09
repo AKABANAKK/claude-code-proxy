@@ -97,6 +97,7 @@ replaced with unknown values at startup, then filled from the new probes.
 | Field | Meaning |
 | --- | --- |
 | `account` | Registered name. |
+| `active` | Whether this was the last account selected for a normal request when the snapshot was written. Startup probes do not select an account. |
 | `asOf` / `asOfUnixSecs` | Snapshot time, as UTC RFC 3339 / Unix seconds. |
 | `lastResponseAt` / `lastResponseStatus` | Last upstream response observed for this account, or `null`. |
 | `switchThreshold` | Usage threshold used by the running proxy, normally `0.98`. |
