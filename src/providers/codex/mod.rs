@@ -328,13 +328,12 @@ impl CodexProvider {
             monitor.upstream_started(&ctx.req_id);
         }
         if want_stream {
-            let stream_request = translated.clone();
             let response = live_stream_response(
                 client,
                 message_id,
                 model,
                 ctx,
-                stream_request,
+                translated,
                 continuation,
                 LiveStreamCompaction {
                     compact_boundary,
@@ -723,6 +722,8 @@ async fn live_stream_response(
     transport: config::CodexTransport,
 ) -> Response {
     let model = model.to_string();
+    // Retries and the response stream share the same immutable request history.
+    let request_body = Arc::new(request_body);
     let request_continuation = continuation.clone();
     let mut cleanup = LiveRequestStateCleanup::new(
         request_continuation.clone(),
@@ -791,7 +792,7 @@ async fn live_stream_response(
             &model,
             ctx.clone(),
             request_continuation.clone(),
-            request_body.clone(),
+            Arc::clone(&request_body),
             compaction,
         )
         .await
@@ -856,7 +857,7 @@ async fn live_stream_response_once(
     model: &str,
     ctx: RequestContext,
     request_continuation: ContinuationReservation,
-    request_body: translate::request::ResponsesRequest,
+    request_body: Arc<translate::request::ResponsesRequest>,
     compaction: LiveStreamCompaction,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
@@ -1076,7 +1077,7 @@ fn remaining_live_stream_response(
     first_chunk: Vec<u8>,
     ctx: RequestContext,
     request_continuation: ContinuationReservation,
-    request_body: translate::request::ResponsesRequest,
+    request_body: Arc<translate::request::ResponsesRequest>,
     compaction: LiveStreamCompaction,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
@@ -1487,7 +1488,17 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
         return map_codex_failure_to_response(message);
     }
     if err.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL) {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &err.message);
+        // The proxy has already spent its own retry budget on this request, so
+        // a client retry only multiplies it: Claude Code resends a 503 up to
+        // ten times, each one repeating the proxy's full retry loop.
+        return (
+            [(
+                HeaderName::from_static("x-should-retry"),
+                HeaderValue::from_static("false"),
+            )],
+            json_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &err.message),
+        )
+            .into_response();
     }
 
     match err.status {
@@ -1983,7 +1994,7 @@ mod tests {
             "claude-opus-4-8",
             ctx,
             continuation,
-            request_body,
+            Arc::new(request_body),
             LiveStreamCompaction {
                 compact_boundary: false,
                 attempt: None,
@@ -2098,7 +2109,7 @@ mod tests {
             &request.model,
             live_test_context(session_id),
             ContinuationReservation::for_owner_turn(None, None),
-            request.clone(),
+            Arc::new(request.clone()),
             LiveStreamCompaction {
                 compact_boundary: true,
                 attempt: Some(attempt),
@@ -2139,6 +2150,8 @@ mod tests {
         assert!(models.contains(&"gpt-6-sol".to_string()));
         assert!(models.contains(&"gpt-6-sol-fast".to_string()));
         assert!(models.contains(&"gpt-6-luna".to_string()));
+        assert!(models.contains(&"gpt-6.1-sol".to_string()));
+        assert!(models.contains(&"gpt-6.1-sol-fast".to_string()));
         assert!(models.contains(&"gpt-5.4".to_string()));
         assert!(models.contains(&"gpt-5.4-mini".to_string()));
     }
@@ -2210,10 +2223,9 @@ mod tests {
 
         assert_eq!(err.status, 503);
         assert_eq!(err.detail.as_deref(), Some(EMPTY_CODEX_COMPLETION_DETAIL));
-        assert_eq!(
-            map_codex_error_to_response(&err).status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
+        let response = map_codex_error_to_response(&err);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["x-should-retry"], "false");
     }
 
     #[test]

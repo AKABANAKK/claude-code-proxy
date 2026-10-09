@@ -44,6 +44,17 @@ An unknown local ID returns a catalog in the error. A known ID can still be reje
 
 Set `ANTHROPIC_SMALL_FAST_MODEL` to a concrete routable ID. Claude Code sends title and small background tasks through that model independently of the main model.
 
+## Anthropic upstream returns a proxy 502
+
+Check `anthropic_upstream_request_failed` in `proxy.log` for `errorChain`,
+`rootCause`, and `reqId`. These identify transport failures before response
+headers, including HTTP/2 stream resets.
+
+Anthropic requests use a new HTTP client for each upstream attempt. Connections
+are not shared between requests, account retries after HTTP 429, or startup
+usage probes. This adds connection setup overhead; responses still stream as
+they arrive. A new connection does not prevent every upstream protocol error.
+
 ## A tool runs twice
 
 Set `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` for Claude Code. Retrying a partially completed stream as non-streaming can duplicate tool calls.

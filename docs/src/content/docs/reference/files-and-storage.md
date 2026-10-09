@@ -39,7 +39,99 @@ OpenCode Go is the exception: it reads its API key from
 `CCP_OPENCODE_API_KEY`, `OPENCODE_API_KEY`, or `opencode.apiKey` in
 `config.json` and does not create a provider auth store.
 
+Registered Claude accounts use `<configuration-root>/anthropic/accounts.json`
+on every platform, with mode `0600` on Unix. The file stores account names,
+tokens, and registration timestamps. The proxy loads it at startup and does not
+read Claude Code's Keychain credentials. Account selection, temporary blocks,
+and invalidation state are kept in memory and reset when the proxy restarts.
+
 The proxy owns these credentials independently of native Codex, Grok, and Cursor Agent stores.
+
+## Claude account usage snapshots
+
+`<state-root>/anthropic/accounts/<account>.json` stores usage separately from
+`proxy.log`, one file per loaded account. For example, the default macOS path
+for `first` is `~/.local/state/claude-code-proxy/anthropic/accounts/first.json`.
+These files contain no tokens and use mode `0600` on Unix.
+
+At server startup, the proxy initializes files for every loaded account and sends
+one small `claude-fable-5-1` request per account (`max_tokens: 1`, no streaming).
+Fable responses can report all three watched windows, including `7d_oi`.
+Up to three probes run concurrently, each with a ten-second timeout. The proxy
+finishes these checks before accepting client requests. They consume a small
+amount of allowance and can start an unused five-hour window.
+
+Each probe updates its account's JSON and the running pool's eligibility using
+the normal 98% threshold, 429 block, and 401 invalidation rules. Checks do not
+advance the preferred account or generate account-selection events. A failed
+check does not prevent checks of the remaining accounts or server startup.
+Missing window headers remain `null`; an HTTP failure is recorded in
+`lastResponseStatus`, while a connection failure leaves it `null`.
+
+`anthropic_accounts_refresh_started` and `anthropic_accounts_refresh_completed`
+mark the startup checks in `proxy.log`. Each account produces
+`anthropic_account_usage_refreshed` or `anthropic_account_usage_refresh_failed`;
+the actual window values and reset times are stored in the individual JSON files.
+The completion event includes pool counts and `failedAccountCount`.
+An HTTP error, a connection error, or a response without any watched window
+headers counts as a failed refresh; unavailable windows are never reported as zero.
+
+During normal traffic, the first account selection and each account switch
+refresh all loaded accounts' snapshots, and each upstream response updates the
+responding account. Previously observed windows are retained within the process.
+Disk writes run on a dedicated worker without delaying upstream responses or
+holding the account pool lock. Pending updates for the same account are combined
+into its newest snapshot, so JSON files can briefly lag behind the running pool.
+The worker preserves observation order and bounds queued snapshots by the number
+of loaded accounts. Startup waits for its queued writes before accepting requests,
+and normal shutdown drains pending writes.
+Runtime snapshots use atomic replacement with OS-managed disk writeback, avoiding
+a forced disk synchronization for every observation. Their contents are recreated
+from the startup probes.
+Commands such as `models` or `kimi auth status` do not query accounts or create
+or overwrite snapshots. Files are replaced atomically; a write failure produces
+`anthropic_account_usage_write_failed` without failing requests or startup.
+Snapshots are not read back to restore pool state after a restart: old data is
+replaced with unknown values at startup, then filled from the new probes.
+
+| Field | Meaning |
+| --- | --- |
+| `account` | Registered name. |
+| `active` | Whether this was the last account selected for a normal request when the snapshot was written. Startup probes do not select an account. |
+| `asOf` / `asOfUnixSecs` | Snapshot time, as UTC RFC 3339 / Unix seconds. |
+| `lastResponseAt` / `lastResponseStatus` | Last upstream response observed for this account, or `null`. |
+| `switchThreshold` | Usage threshold used by the running proxy, normally `0.98`. |
+| `eligible` | Whether the local pool permits selection at `asOf`; this is not confirmation of remaining upstream allowance. |
+| `invalid` | Whether a 401 has invalidated the account in this process. |
+| `blockedUntil` / `blockedUntilUnixSecs` | Latest local block expiry, or `null`. Several windows or a 429 can extend this beyond any individual window reset. |
+| `windows` | Keys `5h`, `7d`, and `7d_oi`, each containing its latest observation or `null` when unknown. |
+
+Each known window contains `utilization` (a fraction, so `0.98` means 98%),
+`observedAt` / `observedAtUnixSecs`, `resetAt` / `resetAtUnixSecs`, and `state`.
+Reset times can be `null` if the upstream omitted them. Missing window headers
+in a later response preserve the previous observation and its original time.
+
+`state` is `below_threshold`, `threshold_reached`, or `reset_elapsed`, evaluated
+at the snapshot's `asOf`. `reset_elapsed` means the advertised reset time has
+passed; the previous utilization remains visible until a new response confirms
+usage in the next window. After queued writes finish, files do not update while
+the proxy is idle, so compare reset and block times with the current time when
+reading an older snapshot.
+
+Lowercase letters, digits, `-`, and `_` are used directly in filenames. Other
+bytes, including uppercase letters, are percent-encoded to avoid path traversal
+and collisions on case-insensitive filesystems. Very long or reserved names use
+a hash filename; the `account` field retains the original name. Files for removed
+accounts may remain as old snapshots; use `anthropic accounts list` to identify
+current registrations.
+
+Selection logs include `registeredAccountCount`, `loadedAccountCount`, and
+`registrationReloadRequired`, distinguishing registrations added on disk from
+the running pool. Registration count and reload status are `null` if the file
+cannot be read. Selection, block, and invalidation logs also include
+`eligibleAccountCount`, `blockedAccountCount`, `invalidAccountCount`, and
+`allAccountsUnavailable`. These counts describe the loaded pool; unknown usage
+does not by itself make an account unavailable.
 
 ## Kimi device ID
 
@@ -48,6 +140,28 @@ Kimi stores a persistent UUID at `<configuration-root>/kimi/device_id` for file-
 ## Structured log
 
 `proxy.log` lives under the state root. It uses JSON Lines and rotates at 20 MiB. Known credential keys, including authorization, access tokens, refresh tokens, ID tokens, and account headers, are redacted before writing.
+
+Anthropic transport failures that produce a proxy 502 also emit
+`anthropic_upstream_request_failed` at warning level. The event contains:
+
+- `reqId`, `account`, and `ms`: the request, selected account, and elapsed time for
+  the failed attempt. `account` is `null` when using incoming credentials or when
+  building the request fails before account selection.
+- `errorChain` and `rootCause`: the error and its nested causes, including the
+  underlying DNS, TLS, connection, or protocol error when available.
+- `phase`: `build`, `connect` (including DNS and TLS), or `send` (the overall
+  request through response headers when the client cannot identify a more
+  specific phase). `isConnect` and `isTimeout` provide the HTTP client's
+  classifications without guessing from error text.
+- `ioKind` and `osError`: the I/O error kind and OS error code, when available.
+- `upstream`: the upstream origin, without URL credentials, path, query, or
+  fragment. Request headers and bodies are not included in this event.
+
+Startup transport failures include the same error details in
+`anthropic_account_usage_refresh_failed`. These events are written with the
+normal logging settings; traffic capture and verbose logging are not required.
+Use `reqId` to correlate a relay failure with `request_completed` and
+`request_failed` in the same file.
 
 A Homebrew service also writes `service.log` under the state root.
 
