@@ -141,17 +141,23 @@ pub struct SelectedImage {
 pub struct AgentServerMessage {
     #[prost(message, optional, tag = "1")]
     pub interaction_update: Option<InteractionUpdate>,
-    #[prost(message, optional, tag = "3")]
+    #[prost(message, optional, tag = "2")]
     pub exec_server_message: Option<ExecServerMessage>,
 }
 
+// Tag numbers verified against the Cursor Agent bundle's protobuf descriptors
+// (2026.10.01-e373342, 12/10/2026): 1 text_delta, 2 tool_call_started,
+// 3 tool_call_completed, 4 thinking_delta, 14 turn_ended. The previous mapping
+// (thinking 1, text 2, turn_ended 3) read tool_call_started as the model's text,
+// which is why a Cursor tool call reached Claude Code as the literal string
+// "call_...\nfc_..." instead of a tool_use block.
 #[derive(Clone, PartialEq, Message)]
 pub struct InteractionUpdate {
     #[prost(message, optional, tag = "1")]
-    pub thinking_delta: Option<ThinkingDelta>,
-    #[prost(message, optional, tag = "2")]
     pub text_delta: Option<TextDelta>,
-    #[prost(message, optional, tag = "3")]
+    #[prost(message, optional, tag = "4")]
+    pub thinking_delta: Option<ThinkingDelta>,
+    #[prost(message, optional, tag = "14")]
     pub turn_ended: Option<TurnEnded>,
 }
 
@@ -179,8 +185,53 @@ pub struct TurnEnded {
     pub cache_write_tokens: u64,
 }
 
+// The frame in which Cursor asks the CLIENT to run a tool. Field numbers from
+// the same descriptors: 1 id, 2 shell_args, 3 write_args, 7 read_args,
+// 14 shell_stream_args, 15 exec_id. Measured live 12/10/2026: a Read arrives as
+// read_args{path, tool_call_id} and a Bash as shell_stream_args with the same
+// ShellArgs shape.
 #[derive(Clone, PartialEq, Message)]
 pub struct ExecServerMessage {
-    #[prost(string, optional, tag = "1")]
-    pub notes_session_id: Option<String>,
+    #[prost(uint64, optional, tag = "1")]
+    pub id: Option<u64>,
+    #[prost(message, optional, tag = "2")]
+    pub shell_args: Option<ShellArgs>,
+    #[prost(message, optional, tag = "3")]
+    pub write_args: Option<WriteArgs>,
+    #[prost(message, optional, tag = "7")]
+    pub read_args: Option<ReadArgs>,
+    #[prost(message, optional, tag = "14")]
+    pub shell_stream_args: Option<ShellArgs>,
+    #[prost(string, optional, tag = "15")]
+    pub exec_id: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ReadArgs {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(string, optional, tag = "2")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct WriteArgs {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(string, tag = "2")]
+    pub file_text: String,
+    #[prost(string, optional, tag = "3")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ShellArgs {
+    #[prost(string, tag = "1")]
+    pub command: String,
+    #[prost(string, optional, tag = "2")]
+    pub working_directory: Option<String>,
+    #[prost(uint64, optional, tag = "3")]
+    pub timeout: Option<u64>,
+    #[prost(string, optional, tag = "4")]
+    pub tool_call_id: Option<String>,
 }

@@ -43,6 +43,11 @@ pub fn frame_cursor_stream(
             CursorStreamEvent::TextDelta { text } => {
                 framer.emit_text_delta(text);
             }
+            CursorStreamEvent::Exec(_) => {
+                // Without an advertised Claude tool and a session id the proxy
+                // cannot hand this exec to the client, and the upstream never
+                // emitted it as text. Dropping it is the honest outcome.
+            }
             CursorStreamEvent::Usage {
                 input_tokens,
                 output_tokens,

@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use once_cell::sync::Lazy;
 
 use crate::anthropic::schema::MessagesRequest;
-use crate::providers::cursor::response::CursorStreamEvent;
+use crate::providers::cursor::response::{CursorExecKind, CursorExecRequest, CursorStreamEvent};
 use crate::providers::cursor::sse::CursorSseFramer;
 use crate::providers::cursor::tool_use_xml::{CursorToolUseXmlParser, RecoveredCursorEvent};
 
@@ -504,6 +504,33 @@ pub fn build_shell_stream_result(
 }
 
 // ---------------------------------------------------------------------------
+// Native exec mapping
+// ---------------------------------------------------------------------------
+
+/// Map a Cursor native exec request onto the Claude tool call that fulfils it.
+///
+/// Cursor asks the client to run its own tools (ExecServerMessage). The three
+/// Claude Code can answer are Read, Write and Bash. `working_directory` is
+/// dropped on purpose: Claude Code already runs Bash in the session's project
+/// directory, and its Bash input has no cwd field.
+pub fn claude_tool_for_exec(exec: &CursorExecRequest) -> Option<(&'static str, serde_json::Value)> {
+    match &exec.kind {
+        CursorExecKind::Read { path } => Some((
+            "Read",
+            serde_json::json!({ "file_path": path }),
+        )),
+        CursorExecKind::Write { path, content } => Some((
+            "Write",
+            serde_json::json!({ "file_path": path, "content": content }),
+        )),
+        CursorExecKind::Shell { command, .. } => Some((
+            "Bash",
+            serde_json::json!({ "command": command }),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bridge start and resume
 // ---------------------------------------------------------------------------
 
@@ -572,6 +599,28 @@ pub fn start_cursor_tool_bridge(
                             paused = true;
                         }
                     }
+                }
+            }
+            CursorStreamEvent::Exec(exec) => {
+                // Cursor asked the client to run one of its own tools. Emit the
+                // equivalent Claude tool_use and stop: Claude Code runs it and
+                // its tool_result travels back in the NEXT request, where
+                // render_cursor_prompt turns it into a <tool_result> block for
+                // the upstream. No pending tool is stored, precisely so that
+                // next request reaches Cursor instead of being answered from
+                // stored events.
+                let bridged = claude_tool_for_exec(exec).filter(|(name, _)| {
+                    state
+                        .allowed_tool_names
+                        .as_ref()
+                        .map_or(true, |allowed| allowed.contains(*name))
+                });
+                if let Some((name, input)) = bridged {
+                    let tool_use_id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
+                    let input_json =
+                        serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                    framer.emit_tool_pause(&tool_use_id, name, &input_json);
+                    paused = true;
                 }
             }
             CursorStreamEvent::Usage {
@@ -737,6 +786,11 @@ pub fn resume_cursor_tool_bridge(
                             }
                         }
                     }
+                }
+                CursorStreamEvent::Exec(_) => {
+                    // Native exec requests are handled when the bridge starts;
+                    // a buffered tail carrying one is dropped rather than
+                    // replayed, because its tool call was already emitted.
                 }
                 CursorStreamEvent::Usage {
                     input_tokens,
