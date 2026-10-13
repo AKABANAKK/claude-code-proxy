@@ -325,7 +325,9 @@ fn events_from_message(msg: &AgentServerMessage, events: &mut Vec<CursorStreamEv
             shell.map(|shell| CursorExecKind::Shell {
                 command: shell.command.clone(),
                 working_directory: shell.working_directory.clone(),
-                timeout_ms: shell.timeout,
+                timeout_ms: shell
+                    .timeout
+                    .and_then(|timeout| u64::try_from(timeout).ok()),
             })
         };
 
@@ -385,9 +387,8 @@ pub fn estimate_request_input_tokens(req: &MessagesRequest) -> u64 {
 mod tests {
     use super::*;
     use crate::providers::cursor::connect::encode_connect_frame;
-    use crate::providers::cursor::proto::*;
+
     use crate::providers::cursor::test_frames;
-    use prost::Message;
 
     #[test]
     fn decodes_text_and_usage_events() {
