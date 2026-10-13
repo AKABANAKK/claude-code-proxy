@@ -711,6 +711,32 @@ async fn answer(exec: &proto::ExecServerMessage, message: ExecAnswer, run: &Live
     true
 }
 
+/// Claude Code's Read answers in `cat -n` form (`     1\talpha`), and may add
+/// `<system-reminder>` text after the file. Cursor's `ReadSuccess.content` is
+/// the file itself: handing it the numbered form made the agent write the
+/// numbers back into the file (measured 13/10: `1\tbeta` on disk).
+fn raw_file_text(read_output: &str) -> String {
+    let mut lines = Vec::new();
+    for line in read_output.lines() {
+        let digits = line.trim_start();
+        let Some(tab) = digits.find('\t') else { break };
+        if tab == 0 || !digits[..tab].bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
+        lines.push(&digits[tab + 1..]);
+    }
+    if lines.is_empty() {
+        // An empty file comes back as a reminder only; anything else is not
+        // the numbered form and passes through untouched.
+        return if read_output.trim_start().starts_with("<system-reminder>") {
+            String::new()
+        } else {
+            read_output.to_string()
+        };
+    }
+    lines.join("\n")
+}
+
 fn stream_close(id: u32) -> proto::AgentClientMessage {
     proto::AgentClientMessage {
         exec_client_control_message: Some(proto::ExecClientControlMessage {
@@ -743,6 +769,7 @@ pub fn exec_result_messages(
                         error: content,
                     })
                 } else {
+                    let content = raw_file_text(&content);
                     proto::read_result::Result::Success(proto::ReadSuccess {
                         path: path.clone(),
                         total_lines: content.lines().count() as i32,
@@ -1732,5 +1759,28 @@ mod tests {
             },
         });
         BridgeRegistry::insert(bridge);
+    }
+
+    #[test]
+    fn read_result_gives_cursor_the_file_without_line_numbers() {
+        assert_eq!(raw_file_text("1\talpha\n2\t"), "alpha\n");
+        assert_eq!(
+            raw_file_text("     1\tfn a() {}\n     2\t\tx\n"),
+            "fn a() {}\n\tx"
+        );
+        assert_eq!(
+            raw_file_text("1\tline\n\n<system-reminder>\nnote\n</system-reminder>"),
+            "line"
+        );
+        assert_eq!(
+            raw_file_text(
+                "<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>"
+            ),
+            ""
+        );
+        assert_eq!(
+            raw_file_text("plain text, not numbered"),
+            "plain text, not numbered"
+        );
     }
 }
