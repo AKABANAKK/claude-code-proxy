@@ -19,6 +19,7 @@ fn help_exposes_account_commands() {
         .success()
         .stdout(contains("add"))
         .stdout(contains("list"))
+        .stdout(contains("update"))
         .stdout(contains("remove"));
 }
 
@@ -31,7 +32,11 @@ fn corrupt_accounts_file_is_not_treated_as_empty_or_overwritten() {
     for content in [r#"{"accounts":["#, r#"{"accounts":"invalid"}"#] {
         std::fs::write(&file, content).unwrap();
 
-        for args in [["list"].as_slice(), ["add", "new"].as_slice()] {
+        for args in [
+            ["list"].as_slice(),
+            ["update"].as_slice(),
+            ["add", "new"].as_slice(),
+        ] {
             Command::cargo_bin("claude-code-proxy")
                 .unwrap()
                 .env("CCP_CONFIG_DIR", config.path())
@@ -106,6 +111,18 @@ fn listed_account<'a>(output: &'a str, name: &str) -> &'a str {
 }
 
 #[test]
+fn update_without_registered_accounts_does_not_contact_upstream_or_create_usage() {
+    let config = TempDir::new().unwrap();
+    anthropic_accounts_command(&config, &["update"])
+        .unwrap()
+        .env("CCP_ANTHROPIC_BASE_URL", "not-a-valid-upstream-url")
+        .assert()
+        .success()
+        .stdout(contains("No Claude accounts registered"));
+    assert!(!list_usage_directory(&config).exists());
+}
+
+#[test]
 fn list_shows_selection_reset_wait_and_remaining_usage_percentages() {
     let config = TempDir::new().unwrap();
     register_list_fixture(&config, &["current", "waiting", "spare", "unknown"]);
@@ -142,16 +159,16 @@ fn list_shows_selection_reset_wait_and_remaining_usage_percentages() {
     let stdout = list_output(&config);
     let current = listed_account(&stdout, "current");
     assert!(current.contains("[稼働中]"));
-    assert!(current.contains("5h: 12.3%  7d: 56.8%  7d_oi: 7.0%"));
+    assert!(current.contains("5h: 12.3% (reset --)  7d: 56.8% (reset --)  7d_oi: 7.0% (reset --)"));
     let waiting = listed_account(&stdout, "waiting");
     assert!(waiting.contains("[リセット待ち]"));
     assert!(waiting.contains("5h: 101.0%"));
     let spare = listed_account(&stdout, "spare");
     assert!(spare.contains("[残あり]"));
-    assert!(spare.contains("5h: 40.0%  7d: 80.0%  7d_oi: --"));
+    assert!(spare.contains("5h: 40.0% (reset --)  7d: 80.0% (reset --)  7d_oi: -- (reset --)"));
     let unknown = listed_account(&stdout, "unknown");
     assert!(unknown.contains("[未確認]"));
-    assert!(unknown.contains("5h: --  7d: --  7d_oi: --"));
+    assert!(unknown.contains("5h: -- (reset --)  7d: -- (reset --)  7d_oi: -- (reset --)"));
 }
 
 #[test]
@@ -228,7 +245,8 @@ fn list_expires_blocks_preserves_old_usage_and_identifies_invalid_credentials() 
     let stdout = list_output(&config);
     let recovered = listed_account(&stdout, "recovered");
     assert!(recovered.contains("[残あり]"));
-    assert!(recovered.contains("5h: 100.0%*  7d: 40.0%"));
+    assert!(recovered.contains("5h: 100.0%* (reset "));
+    assert!(recovered.contains("  7d: 40.0% (reset "));
     assert!(listed_account(&stdout, "invalid").contains("[認証無効]"));
     assert!(listed_account(&stdout, "old").contains("[未確認]"));
     assert!(stdout.contains("* はリセット時刻経過後の前回値"));
@@ -259,7 +277,7 @@ fn list_does_not_use_corrupt_or_mismatched_account_usage() {
     for name in ["corrupt", "mismatched"] {
         let row = listed_account(&stdout, name);
         assert!(row.contains("[未確認]"));
-        assert!(row.contains("5h: --  7d: --  7d_oi: --"));
+        assert!(row.contains("5h: -- (reset --)  7d: -- (reset --)  7d_oi: -- (reset --)"));
     }
     assert!(listed_account(&stdout, "spare").contains("[残あり]  5h: 0.0%"));
 }
@@ -388,15 +406,7 @@ impl Drop for ProxyProcess {
     }
 }
 
-#[tokio::test]
-async fn serve_refreshes_all_six_accounts_before_any_client_request() {
-    use std::process::Stdio;
-    use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let config = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap();
-    let names = ["first", "second", "third", "forth", "five", "six"];
+fn register_probe_fixture(config: &TempDir, names: &[&str]) {
     let registrations = config.path().join("anthropic");
     std::fs::create_dir_all(&registrations).unwrap();
     let accounts: Vec<_> = names
@@ -410,6 +420,278 @@ async fn serve_refreshes_all_six_accounts_before_any_client_request() {
         serde_json::to_vec(&serde_json::json!({"accounts": accounts})).unwrap(),
     )
     .unwrap();
+}
+
+async fn read_probe_request(stream: &mut tokio::net::TcpStream) -> (String, serde_json::Value) {
+    use tokio::io::AsyncReadExt;
+
+    let mut request = Vec::new();
+    let body_offset = loop {
+        let mut chunk = [0; 4096];
+        let len = stream.read(&mut chunk).await.unwrap();
+        assert_ne!(len, 0);
+        request.extend_from_slice(&chunk[..len]);
+        let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&request[..end]);
+        let body_len = headers
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        if request.len() >= end + 4 + body_len {
+            break end + 4;
+        }
+    };
+    (
+        String::from_utf8_lossy(&request[..body_offset]).into_owned(),
+        serde_json::from_slice(&request[body_offset..]).unwrap(),
+    )
+}
+
+const MOCK_UPDATED_USAGE: &str = concat!(
+    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n",
+    "anthropic-ratelimit-unified-5h-utilization: 0.1\r\n",
+    "anthropic-ratelimit-unified-5h-reset: 4102444800\r\n",
+    "anthropic-ratelimit-unified-7d-utilization: 0.2\r\n",
+    "anthropic-ratelimit-unified-7d-reset: 4102531200\r\n",
+    "anthropic-ratelimit-unified-7d_oi-utilization: 0.3\r\n",
+    "anthropic-ratelimit-unified-7d_oi-reset: 4102531200\r\n\r\n{}"
+);
+
+async fn update_against_mock(
+    config: &TempDir,
+    responses: &[(&str, Option<&str>)],
+) -> std::process::Output {
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"));
+    command
+        .args(["anthropic", "accounts", "update"])
+        .env("CCP_CONFIG_DIR", config.path())
+        .env("XDG_STATE_HOME", config.path())
+        .env("LOCALAPPDATA", config.path())
+        .env("CCP_ANTHROPIC_SWITCH_THRESHOLD", "98")
+        .env(
+            "CCP_ANTHROPIC_BASE_URL",
+            format!("http://{}", upstream.local_addr().unwrap()),
+        )
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .env("TZ", "UTC");
+    let output = tokio::task::spawn_blocking(move || command.output().unwrap());
+    let mock = async {
+        let mut checked = std::collections::HashSet::new();
+        for _ in responses {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let (headers, body) = read_probe_request(&mut stream).await;
+            assert!(headers.starts_with("POST /v1/messages?beta=true HTTP/1.1"));
+            assert_eq!(body["max_tokens"], 1);
+            assert_eq!(body["stream"], false);
+            let (name, response) = responses
+                .iter()
+                .find(|(name, _)| headers.contains(&format!("Bearer test-token-{name}\r\n")))
+                .unwrap();
+            assert!(checked.insert(*name), "account probed more than once");
+            if let Some(response) = response {
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        }
+    };
+    let (output, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(output, mock)
+    })
+    .await
+    .expect("accounts update should finish all probes");
+    let output = output.unwrap();
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("test-token-"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("test-token-"));
+    output
+}
+
+#[tokio::test]
+async fn update_refreshes_all_accounts_and_preserves_selection() {
+    let config = TempDir::new().unwrap();
+    let names = ["first", "second", "third", "fourth", "fifth", "sixth"];
+    register_probe_fixture(&config, &names);
+    for name in names {
+        write_list_usage(
+            &config,
+            name,
+            serde_json::json!({
+                "account": name, "active": name == "second", "invalid": true,
+                "windows": {"5h": {"utilization": 0.8, "resetAtUnixSecs": 1}}
+            }),
+        );
+    }
+    let registry = config.path().join("anthropic/accounts.json");
+    let registrations = std::fs::read(&registry).unwrap();
+    let responses: Vec<_> = names
+        .iter()
+        .map(|name| (*name, Some(MOCK_UPDATED_USAGE)))
+        .collect();
+    let output = update_against_mock(&config, &responses).await;
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Updated usage for 6 of 6 Claude accounts"));
+    assert!(listed_account(&stdout, "second").contains("[稼働中]"));
+    assert!(stdout.contains("5h: 10.0% (reset 2100/01/01 00:00)"));
+    assert_eq!(std::fs::read(registry).unwrap(), registrations);
+    for name in names {
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(list_usage_directory(&config).join(format!("{name}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot["lastResponseStatus"], 200);
+        assert_eq!(snapshot["active"], name == "second");
+        assert_eq!(snapshot["eligible"], true);
+        assert_eq!(snapshot["invalid"], false);
+        assert_eq!(snapshot["windows"]["5h"]["utilization"], 0.1);
+        assert_eq!(snapshot["windows"]["7d"]["utilization"], 0.2);
+        assert_eq!(snapshot["windows"]["7d_oi"]["utilization"], 0.3);
+    }
+}
+
+#[tokio::test]
+async fn update_keeps_previous_usage_on_failures_and_preserves_missing_windows() {
+    let config = TempDir::new().unwrap();
+    let names = [
+        "current",
+        "limited",
+        "invalid",
+        "offline",
+        "missing",
+        "unavailable",
+    ];
+    register_probe_fixture(&config, &names);
+    for name in names {
+        write_list_usage(
+            &config,
+            name,
+            serde_json::json!({
+                "account": name, "active": name == "current",
+                "windows": {
+                    "5h": {"utilization": 0.8, "observedAtUnixSecs": 42, "resetAtUnixSecs": 1},
+                    "7d": {"utilization": 1.0, "observedAtUnixSecs": 42, "resetAtUnixSecs": 4102531200_u64},
+                    "7d_oi": {"utilization": 0.3, "observedAtUnixSecs": 42, "resetAtUnixSecs": 1}
+                }
+            }),
+        );
+    }
+    let previous: Vec<_> = ["offline", "missing", "unavailable"]
+        .iter()
+        .map(|name| {
+            let path = list_usage_directory(&config).join(format!("{name}.json"));
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    let output = update_against_mock(
+        &config,
+        &[
+            (
+                "current",
+                Some(concat!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n",
+                    "anthropic-ratelimit-unified-5h-utilization: 0.1\r\n",
+                    "anthropic-ratelimit-unified-5h-reset: 4102444800\r\n\r\n{}"
+                )),
+            ),
+            (
+                "limited",
+                Some(concat!(
+                    "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 2\r\nconnection: close\r\n",
+                    "anthropic-ratelimit-unified-5h-utilization: 1.0\r\n",
+                    "anthropic-ratelimit-unified-5h-reset: 4102444800\r\n\r\n{}"
+                )),
+            ),
+            (
+                "invalid",
+                Some(
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                ),
+            ),
+            ("offline", None),
+            (
+                "missing",
+                Some("HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"),
+            ),
+            (
+                "unavailable",
+                Some(
+                    "HTTP/1.1 503 Unavailable\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                ),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Updated usage for 2 of 6 Claude accounts"));
+    assert!(listed_account(&stdout, "current").contains("[リセット待ち]"));
+    assert!(listed_account(&stdout, "invalid").contains("[認証無効]"));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    for name in ["invalid", "offline", "missing", "unavailable"] {
+        assert!(stderr.contains(&format!("Cannot update usage for {name}:")));
+    }
+    for (path, bytes) in previous {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+    let current: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(list_usage_directory(&config).join("current.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(current["active"], true);
+    assert_eq!(current["eligible"], false);
+    assert_eq!(current["windows"]["5h"]["utilization"], 0.1);
+    assert_eq!(current["windows"]["7d"]["utilization"], 1.0);
+    assert_eq!(current["windows"]["7d"]["observedAtUnixSecs"], 42);
+    assert_eq!(current["windows"]["7d_oi"]["state"], "reset_elapsed");
+    let limited: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(list_usage_directory(&config).join("limited.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(limited["lastResponseStatus"], 429);
+    assert_eq!(limited["eligible"], false);
+}
+
+#[tokio::test]
+async fn update_reports_usage_write_failures() {
+    let config = TempDir::new().unwrap();
+    register_probe_fixture(&config, &["first"]);
+    let snapshot_path = list_usage_directory(&config).join("first.json");
+    std::fs::create_dir_all(&snapshot_path).unwrap();
+    let output = update_against_mock(&config, &[("first", Some(MOCK_UPDATED_USAGE))]).await;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("Updated usage for 0 of 1 Claude accounts")
+    );
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("Cannot save usage for first:")
+    );
+    assert!(snapshot_path.is_dir());
+}
+
+#[tokio::test]
+async fn serve_refreshes_all_six_accounts_before_any_client_request() {
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    let config = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let names = ["first", "second", "third", "forth", "five", "six"];
+    register_probe_fixture(&config, &names);
     let usage = state.path().join("claude-code-proxy/anthropic/accounts");
     std::fs::create_dir_all(&usage).unwrap();
     std::fs::write(
@@ -443,49 +725,20 @@ async fn serve_refreshes_all_six_accounts_before_any_client_request() {
         let mut checked = std::collections::HashSet::new();
         for _ in names {
             let (mut stream, _) = upstream.accept().await.unwrap();
-            let mut request = Vec::new();
-            let body_offset = loop {
-                let mut chunk = [0; 4096];
-                let len = stream.read(&mut chunk).await.unwrap();
-                assert_ne!(len, 0);
-                request.extend_from_slice(&chunk[..len]);
-                let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
-                    continue;
-                };
-                let headers = String::from_utf8_lossy(&request[..end]);
-                let body_len = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (key, value) = line.split_once(':')?;
-                        key.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap();
-                if request.len() >= end + 4 + body_len {
-                    break end + 4;
-                }
-            };
-            let headers = String::from_utf8_lossy(&request[..body_offset]);
+            let (headers, body) = read_probe_request(&mut stream).await;
             assert!(headers.starts_with("POST /v1/messages?beta=true HTTP/1.1"));
             let account = names
                 .iter()
                 .find(|name| headers.contains(&format!("Bearer test-token-{name}\r\n")))
                 .unwrap();
             assert!(checked.insert(*account), "account probed more than once");
-            let body: serde_json::Value = serde_json::from_slice(&request[body_offset..]).unwrap();
             assert_eq!(body["max_tokens"], 1);
             assert_eq!(body["stream"], false);
 
-            let response = concat!(
-                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n",
-                "anthropic-ratelimit-unified-5h-utilization: 0.1\r\n",
-                "anthropic-ratelimit-unified-5h-reset: 4102444800\r\n",
-                "anthropic-ratelimit-unified-7d-utilization: 0.2\r\n",
-                "anthropic-ratelimit-unified-7d-reset: 4102531200\r\n",
-                "anthropic-ratelimit-unified-7d_oi-utilization: 0.3\r\n",
-                "anthropic-ratelimit-unified-7d_oi-reset: 4102531200\r\n\r\n{}"
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
+            stream
+                .write_all(MOCK_UPDATED_USAGE.as_bytes())
+                .await
+                .unwrap();
         }
         loop {
             let ready = names.iter().all(|name| {

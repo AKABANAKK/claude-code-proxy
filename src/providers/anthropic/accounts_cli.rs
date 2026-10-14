@@ -1,16 +1,21 @@
 //! CLI entry point for proxy-owned Claude account registrations.
 
 use anyhow::Result;
+use axum::http::StatusCode;
 use clap::Subcommand;
+use futures_util::{StreamExt, stream};
+use jiff::{Timestamp, tz::TimeZone};
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::account_relay::{USAGE_PROBE_CONCURRENCY, probe_account};
 use super::account_usage::UsageFiles;
-use super::accounts;
-use crate::paths;
+use super::pool::{AccountPool, PoolAccount};
+use super::{accounts, ratelimit};
+use crate::{config, paths};
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -25,8 +30,10 @@ pub enum Command {
 pub enum AccountsCommand {
     /// Register a token from `claude setup-token` read from standard input
     Add { name: String },
-    /// List registered accounts, selection status, and observed usage
+    /// List registered accounts, selection status, observed usage, and reset times
     List,
+    /// Fetch and save usage for all registered accounts, then show the updated list
+    Update,
     /// Remove a registered account
     Remove { name: String },
 }
@@ -68,6 +75,7 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
             }
             let usage = UsageFiles::new(paths::state_dir().join("anthropic").join("accounts"));
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+            let time_zone = TimeZone::system();
             let snapshots: Vec<_> = stored
                 .accounts
                 .iter()
@@ -95,18 +103,41 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
                     .and_then(|snapshot| snapshot["active"].as_bool())
                     .unwrap_or_else(|| legacy_active.as_deref() == Some(account.name.as_str()));
                 println!(
-                    "{}. {}  [{}]  5h: {}  7d: {}  7d_oi: {}  added {}",
+                    "{}. {}  [{}]  5h: {} (reset {})  7d: {} (reset {})  7d_oi: {} (reset {})  added {}",
                     index + 1,
                     account.name,
                     account_status(snapshot, active, now),
                     format_window_usage(snapshot, "5h", now),
+                    format_window_reset_date(snapshot, "5h", &time_zone),
                     format_window_usage(snapshot, "7d", now),
+                    format_window_reset_date(snapshot, "7d", &time_zone),
                     format_window_usage(snapshot, "7d_oi", now),
+                    format_window_reset_date(snapshot, "7d_oi", &time_zone),
                     format_account_added_date(account.added_at)
                 );
             }
             println!(
                 "使用率は最後に取得した値です。-- は未取得、* はリセット時刻経過後の前回値です。"
+            );
+            Ok(())
+        }
+        AccountsCommand::Update => {
+            let stored = store.load()?;
+            if stored.accounts.is_empty() {
+                println!("No Claude accounts registered");
+                return Ok(());
+            }
+            let account_count = stored.accounts.len();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let updated = runtime.block_on(update_account_usage(stored.accounts));
+            println!("Updated usage for {updated} of {account_count} Claude accounts");
+            run_accounts(AccountsCommand::List)?;
+            anyhow::ensure!(
+                updated == account_count,
+                "Failed to update usage for {} Claude accounts",
+                account_count - updated
             );
             Ok(())
         }
@@ -119,6 +150,88 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn update_account_usage(accounts: Vec<accounts::StoredAnthropicAccount>) -> usize {
+    let usage = UsageFiles::new(paths::state_dir().join("anthropic").join("accounts"));
+    let mut pool = AccountPool::new(
+        accounts
+            .into_iter()
+            .map(|account| PoolAccount {
+                name: account.name,
+                token: account.token,
+            })
+            .collect(),
+        config::anthropic_switch_threshold(),
+        None,
+    );
+    let base_url = config::anthropic_base_url();
+    let mut probes = stream::iter(pool.observation_targets())
+        .map(|selection| {
+            let base_url = &base_url;
+            async move {
+                let response = probe_account(base_url, &selection.account.token).await;
+                (selection, response)
+            }
+        })
+        .buffer_unordered(USAGE_PROBE_CONCURRENCY);
+    let mut updated = 0;
+    while let Some((selection, response)) = probes.next().await {
+        let name = &selection.account.name;
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!("Cannot update usage for {name}: {}", err.without_url());
+                continue;
+            }
+        };
+        let status = response.status();
+        let observation = ratelimit::observe(response.headers());
+        let has_usage = !observation.windows.is_empty();
+        let refreshed =
+            has_usage && (status.is_success() || status == StatusCode::TOO_MANY_REQUESTS);
+        if !refreshed
+            && status != StatusCode::UNAUTHORIZED
+            && status != StatusCode::TOO_MANY_REQUESTS
+        {
+            eprintln!("Cannot update usage for {name}: HTTP {status}, no usable usage response");
+            continue;
+        }
+        let previous = match usage.read(name) {
+            Ok(previous) => previous,
+            Err(err) => {
+                eprintln!("Cannot load previous usage for {name}: {err:#}");
+                None
+            }
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        pool.observe(&selection, status, &observation, now);
+        if let Some(previous) = &previous {
+            pool.preserve_unobserved_windows(&selection, previous, now);
+        }
+        let mut snapshot = pool.usage_snapshot(&selection, now);
+        if let Some(active) = previous
+            .as_ref()
+            .and_then(|snapshot| snapshot["active"].as_bool())
+        {
+            snapshot["active"] = Value::Bool(active);
+        } else {
+            snapshot.as_object_mut().unwrap().remove("active");
+        }
+        if let Err(err) = usage.save(name, &snapshot) {
+            eprintln!("Cannot save usage for {name}: {err:#}");
+            continue;
+        }
+        if refreshed {
+            updated += 1;
+        } else {
+            eprintln!("Cannot update usage for {name}: HTTP {status}");
+        }
+    }
+    updated
 }
 
 fn account_status(snapshot: Option<&Value>, active: bool, now: u64) -> &'static str {
@@ -168,6 +281,24 @@ fn format_window_usage(snapshot: Option<&Value>, window: &str, now: u64) -> Stri
         .as_u64()
         .is_some_and(|reset| reset <= now);
     format!("{percent:.1}%{}", if stale { "*" } else { "" })
+}
+
+fn format_window_reset_date(
+    snapshot: Option<&Value>,
+    window: &str,
+    time_zone: &TimeZone,
+) -> String {
+    let reset_at = snapshot
+        .and_then(|snapshot| snapshot["windows"][window]["resetAtUnixSecs"].as_u64())
+        .and_then(|seconds| i64::try_from(seconds).ok())
+        .and_then(|seconds| Timestamp::from_second(seconds).ok());
+    match reset_at {
+        Some(reset_at) => reset_at
+            .to_zoned(time_zone.clone())
+            .strftime("%Y/%m/%d %H:%M")
+            .to_string(),
+        None => "--".into(),
+    }
 }
 
 /// Older proxies only record the selected account in the event log.
