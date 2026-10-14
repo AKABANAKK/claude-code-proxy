@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 use super::account_usage::{ObservedWindow, timestamp};
-use super::ratelimit::{RateLimitObservation, WATCHED_WINDOWS};
+use super::ratelimit::{RateLimitObservation, WATCHED_WINDOWS, WindowUsage};
 
 const FIRST_ACCOUNT_INDEX: usize = 0;
 /// How long an account stays out of rotation when the upstream gives no recovery time.
@@ -281,6 +281,52 @@ impl AccountPool {
             self.threshold,
             self.last_used == Some(selection.index),
         )
+    }
+
+    /// A manual refresh may omit a window. Keep its last observation without
+    /// treating an elapsed reset as confirmation of a new allowance.
+    pub(super) fn preserve_unobserved_windows(
+        &mut self,
+        selection: &Selection,
+        previous: &Value,
+        now: u64,
+    ) {
+        let state = &mut self.accounts[selection.index];
+        for window in WATCHED_WINDOWS {
+            if state.windows.contains_key(window) {
+                continue;
+            }
+            let usage = &previous["windows"][window];
+            let Some(utilization) = usage["utilization"]
+                .as_f64()
+                .filter(|value| value.is_finite() && *value >= 0.0)
+            else {
+                continue;
+            };
+            let Some(observed_at) = usage["observedAtUnixSecs"].as_u64() else {
+                continue;
+            };
+            let reset_at_unix_secs = usage["resetAtUnixSecs"].as_u64();
+            if utilization >= self.threshold && reset_at_unix_secs.is_none_or(|reset| reset > now) {
+                state.block_until(reset_at_unix_secs.unwrap_or_else(|| {
+                    previous["blockedUntilUnixSecs"]
+                        .as_u64()
+                        .filter(|until| *until > now)
+                        .unwrap_or_else(|| now.saturating_add(BLOCK_WITHOUT_RESET_HEADER_SECS))
+                }));
+            }
+            state.windows.insert(
+                window,
+                ObservedWindow {
+                    usage: WindowUsage {
+                        window,
+                        utilization,
+                        reset_at_unix_secs,
+                    },
+                    observed_at,
+                },
+            );
+        }
     }
 
     pub(super) fn count_fields(&self, now: u64) -> serde_json::Map<String, Value> {

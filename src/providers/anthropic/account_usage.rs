@@ -81,6 +81,11 @@ impl UsageFiles {
         Ok(Some(snapshot))
     }
 
+    /// Explicit CLI updates report storage failures to the caller.
+    pub fn save(&self, account: &str, snapshot: &Value) -> anyhow::Result<()> {
+        write_snapshot(&self.directory, account, snapshot)
+    }
+
     /// Call while holding the pool lock to preserve observation order. Only the
     /// newest pending snapshot per account is retained; no disk I/O runs here.
     pub fn write(&self, account: &str, snapshot: Value) {

@@ -17,9 +17,9 @@ use crate::anthropic::error::json_error;
 use crate::logging::{Logger, create_logger};
 use crate::traffic::TrafficCapture;
 
-const STARTUP_PROBE_MODEL: &str = "claude-fable-5-1";
-const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-const STARTUP_PROBE_CONCURRENCY: usize = 3;
+const USAGE_PROBE_MODEL: &str = "claude-fable-5-1";
+const USAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const USAGE_PROBE_CONCURRENCY: usize = 3;
 
 pub(super) struct AccountRelay {
     pool: Option<Mutex<AccountPool>>,
@@ -44,8 +44,8 @@ impl AccountRelay {
     pub(super) fn with_usage_directory(pool: Option<AccountPool>, directory: PathBuf) -> Self {
         let mut relay = Self::with_pool(pool);
         relay.usage_files = Some(UsageFiles::new(directory));
-        // Read-only CLI commands construct providers too. Only server startup
-        // and relayed traffic may initialize or overwrite snapshots.
+        // Read-only CLI commands construct providers too. Snapshot writes must
+        // be triggered explicitly by startup, relayed traffic, or accounts update.
         relay
     }
 
@@ -67,7 +67,7 @@ impl AccountRelay {
                     serde_json::json!(targets.len()),
                 ),
                 ("source".into(), serde_json::json!("startup")),
-                ("model".into(), serde_json::json!(STARTUP_PROBE_MODEL)),
+                ("model".into(), serde_json::json!(USAGE_PROBE_MODEL)),
             ])),
         );
         let mut probes = stream::iter(targets)
@@ -76,7 +76,7 @@ impl AccountRelay {
                 let response = probe_account(base_url, &selection.account.token).await;
                 (selection, response, started.elapsed())
             })
-            .buffer_unordered(STARTUP_PROBE_CONCURRENCY);
+            .buffer_unordered(USAGE_PROBE_CONCURRENCY);
         let mut failures = 0;
         while let Some((selection, response, elapsed)) = probes.next().await {
             let mut fields = serde_json::Map::from_iter([
@@ -223,7 +223,10 @@ impl AccountRelay {
     }
 }
 
-async fn probe_account(base_url: &str, token: &str) -> Result<reqwest::Response, reqwest::Error> {
+pub(super) async fn probe_account(
+    base_url: &str,
+    token: &str,
+) -> Result<reqwest::Response, reqwest::Error> {
     // setup-token credentials support model requests. Fable responses include
     // the 7d_oi window, which an Opus-only request may omit.
     new_upstream_client()?
@@ -239,9 +242,9 @@ async fn probe_account(base_url: &str, token: &str) -> Result<reqwest::Response,
             concat!("claude-code-proxy/", env!("CARGO_PKG_VERSION")),
         )
         .header("x-app", "cli")
-        .timeout(STARTUP_PROBE_TIMEOUT)
+        .timeout(USAGE_PROBE_TIMEOUT)
         .json(&serde_json::json!({
-            "model": STARTUP_PROBE_MODEL,
+            "model": USAGE_PROBE_MODEL,
             "max_tokens": 1,
             "stream": false,
             "system": "You are Claude Code, Anthropic's official CLI for Claude.",
