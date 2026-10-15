@@ -98,7 +98,13 @@ claude-code-proxy anthropic accounts remove <name>
 `add` prompts for one token on standard input; the token is not a command-line
 argument. Names must be nonempty and unique. `list` shows names, registration
 dates, the last observed selection status, and usage percentages with reset times
-for `5h`, `7d`, and `7d_oi` in switching order. Reset times use `yyyy/mm/dd hh:mm`
+for `5h`, `7d`, and `7d_oi`. Available accounts appear first, followed by blocked
+accounts in estimated recovery order. Recovery waits for all exhausted windows,
+so a weekly limit can keep an account blocked after its five-hour window resets.
+The aligned `利用可` column shows `今すぐ`, the estimated recovery time, `不明`,
+or `要再認証`. Unknown recovery times and invalid accounts appear last; equal
+times retain registration order. A retry deadline without quota-window data
+is not treated as a known reset time. Reset times use `yyyy/mm/dd hh:mm`
 in the system's local time zone; `--` means the reset time is unknown.
 Status labels are `稼働中` (selected),
 `リセット待ち` (blocked until recovery), and `残あり` (available with observed usage).

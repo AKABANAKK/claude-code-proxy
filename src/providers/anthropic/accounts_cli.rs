@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use unicode_width::UnicodeWidthStr;
 
 use super::account_relay::{USAGE_PROBE_CONCURRENCY, probe_account};
 use super::account_usage::UsageFiles;
@@ -97,28 +98,72 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
                 })
                 .then(|| last_selected_account(&paths::log_file(), &stored.accounts))
                 .flatten();
-            for (index, (account, snapshot)) in stored.accounts.iter().zip(&snapshots).enumerate() {
-                let snapshot = snapshot.as_ref();
-                let active = snapshot
-                    .and_then(|snapshot| snapshot["active"].as_bool())
-                    .unwrap_or_else(|| legacy_active.as_deref() == Some(account.name.as_str()));
-                println!(
-                    "{}. {}  [{}]  5h: {} (reset {})  7d: {} (reset {})  7d_oi: {} (reset {})  added {}",
-                    index + 1,
-                    account.name,
-                    account_status(snapshot, active, now),
-                    format_window_usage(snapshot, "5h", now),
-                    format_window_reset_date(snapshot, "5h", &time_zone),
-                    format_window_usage(snapshot, "7d", now),
-                    format_window_reset_date(snapshot, "7d", &time_zone),
-                    format_window_usage(snapshot, "7d_oi", now),
-                    format_window_reset_date(snapshot, "7d_oi", &time_zone),
-                    format_account_added_date(account.added_at)
-                );
+            let threshold = config::anthropic_switch_threshold();
+            let mut entries: Vec<_> = stored
+                .accounts
+                .iter()
+                .zip(&snapshots)
+                .map(|(account, snapshot)| {
+                    let snapshot = snapshot.as_ref();
+                    let active = snapshot
+                        .and_then(|snapshot| snapshot["active"].as_bool())
+                        .unwrap_or_else(|| legacy_active.as_deref() == Some(account.name.as_str()));
+                    let availability = account_availability(snapshot, active, now, threshold);
+                    (account, snapshot, active, availability)
+                })
+                .collect();
+            entries.sort_by_key(|(_, _, _, availability)| *availability);
+            let rows: Vec<_> = entries
+                .into_iter()
+                .enumerate()
+                .map(|(index, (account, snapshot, active, availability))| {
+                    let status = match availability {
+                        AccountAvailability::ResetsAt(_) => "リセット待ち",
+                        _ => account_status(snapshot, active, now),
+                    };
+                    [
+                        format!("{}. {}", index + 1, account.name),
+                        format!("[{status}]"),
+                        format_account_availability(availability, &time_zone),
+                        format!(
+                            "5h: {} (reset {})",
+                            format_window_usage(snapshot, "5h", now),
+                            format_window_reset_date(snapshot, "5h", &time_zone),
+                        ),
+                        format!(
+                            "7d: {} (reset {})",
+                            format_window_usage(snapshot, "7d", now),
+                            format_window_reset_date(snapshot, "7d", &time_zone),
+                        ),
+                        format!(
+                            "7d_oi: {} (reset {})",
+                            format_window_usage(snapshot, "7d_oi", now),
+                            format_window_reset_date(snapshot, "7d_oi", &time_zone),
+                        ),
+                        format!("added {}", format_account_added_date(account.added_at)),
+                    ]
+                })
+                .collect();
+            // Terminal cell widths keep Japanese names and statuses aligned too.
+            let widths: [usize; 7] = std::array::from_fn(|column| {
+                rows.iter()
+                    .map(|row| row[column].width())
+                    .max()
+                    .unwrap_or_default()
+            });
+            for row in rows {
+                let line = row
+                    .iter()
+                    .zip(widths)
+                    .map(|(cell, width)| format!("{cell}{}", " ".repeat(width - cell.width())))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                println!("{}", line.trim_end());
             }
             println!(
                 "使用率は最後に取得した値です。-- は未取得、* はリセット時刻経過後の前回値です。"
             );
+            println!("利用可は保存情報からの目安です。日時不明のアカウントは末尾に表示します。");
             Ok(())
         }
         AccountsCommand::Update => {
@@ -234,6 +279,79 @@ async fn update_account_usage(accounts: Vec<accounts::StoredAnthropicAccount>) -
     updated
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AccountAvailability {
+    Now,
+    ResetsAt(u64),
+    Unknown,
+    Invalid,
+}
+
+fn account_availability(
+    snapshot: Option<&Value>,
+    active: bool,
+    now: u64,
+    threshold: f64,
+) -> AccountAvailability {
+    let Some(snapshot) = snapshot else {
+        return AccountAvailability::Unknown;
+    };
+    if snapshot["invalid"].as_bool() == Some(true) {
+        return AccountAvailability::Invalid;
+    }
+    let threshold = snapshot["switchThreshold"]
+        .as_f64()
+        .filter(|value| value.is_finite() && *value > 0.0 && *value <= 1.0)
+        .unwrap_or(threshold);
+    let blocked_until = snapshot["blockedUntilUnixSecs"].as_u64();
+    let mut resets_at = None;
+    let mut has_current_usage = false;
+    for window in ratelimit::WATCHED_WINDOWS {
+        let usage = &snapshot["windows"][window];
+        let Some(utilization) = usage["utilization"]
+            .as_f64()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+        else {
+            continue;
+        };
+        let reset = usage["resetAtUnixSecs"].as_u64();
+        if reset.is_some_and(|reset| reset <= now) {
+            continue;
+        }
+        has_current_usage = true;
+        if utilization >= threshold {
+            let Some(reset) = reset else {
+                return AccountAvailability::Unknown;
+            };
+            resets_at = Some(resets_at.map_or(reset, |previous: u64| previous.max(reset)));
+        }
+    }
+    if let Some(reset) = resets_at {
+        return AccountAvailability::ResetsAt(reset.max(blocked_until.unwrap_or(0)));
+    }
+    // A retry deadline without exhausted-window data does not establish a quota reset.
+    if blocked_until.is_some_and(|until| until > now)
+        || (blocked_until.is_none() && snapshot["eligible"].as_bool() == Some(false))
+    {
+        return AccountAvailability::Unknown;
+    }
+    if active || has_current_usage {
+        AccountAvailability::Now
+    } else {
+        AccountAvailability::Unknown
+    }
+}
+
+fn format_account_availability(availability: AccountAvailability, time_zone: &TimeZone) -> String {
+    let value = match availability {
+        AccountAvailability::Now => "今すぐ".into(),
+        AccountAvailability::ResetsAt(reset) => format_local_date(Some(reset), time_zone),
+        AccountAvailability::Unknown => "不明".into(),
+        AccountAvailability::Invalid => "要再認証".into(),
+    };
+    format!("利用可: {value}")
+}
+
 fn account_status(snapshot: Option<&Value>, active: bool, now: u64) -> &'static str {
     if let Some(snapshot) = snapshot {
         if snapshot["invalid"].as_bool() == Some(true) {
@@ -288,8 +406,14 @@ fn format_window_reset_date(
     window: &str,
     time_zone: &TimeZone,
 ) -> String {
-    let reset_at = snapshot
-        .and_then(|snapshot| snapshot["windows"][window]["resetAtUnixSecs"].as_u64())
+    format_local_date(
+        snapshot.and_then(|snapshot| snapshot["windows"][window]["resetAtUnixSecs"].as_u64()),
+        time_zone,
+    )
+}
+
+fn format_local_date(seconds: Option<u64>, time_zone: &TimeZone) -> String {
+    let reset_at = seconds
         .and_then(|seconds| i64::try_from(seconds).ok())
         .and_then(|seconds| Timestamp::from_second(seconds).ok());
     match reset_at {

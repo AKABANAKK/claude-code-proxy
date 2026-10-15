@@ -103,11 +103,18 @@ fn list_output(config: &TempDir) -> String {
     stdout
 }
 
-fn listed_account<'a>(output: &'a str, name: &str) -> &'a str {
+fn listed_account(output: &str, name: &str) -> String {
     output
         .lines()
-        .find(|line| line.contains(&format!(". {name}  [")))
+        .find(|line| {
+            line.split_once(". ")
+                .and_then(|(_, account)| account.strip_prefix(name))
+                .is_some_and(|remaining| remaining.trim_start().starts_with('['))
+        })
         .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[test]
@@ -159,16 +166,171 @@ fn list_shows_selection_reset_wait_and_remaining_usage_percentages() {
     let stdout = list_output(&config);
     let current = listed_account(&stdout, "current");
     assert!(current.contains("[稼働中]"));
-    assert!(current.contains("5h: 12.3% (reset --)  7d: 56.8% (reset --)  7d_oi: 7.0% (reset --)"));
+    assert!(current.contains("5h: 12.3% (reset --) 7d: 56.8% (reset --) 7d_oi: 7.0% (reset --)"));
     let waiting = listed_account(&stdout, "waiting");
     assert!(waiting.contains("[リセット待ち]"));
     assert!(waiting.contains("5h: 101.0%"));
     let spare = listed_account(&stdout, "spare");
     assert!(spare.contains("[残あり]"));
-    assert!(spare.contains("5h: 40.0% (reset --)  7d: 80.0% (reset --)  7d_oi: -- (reset --)"));
+    assert!(spare.contains("5h: 40.0% (reset --) 7d: 80.0% (reset --) 7d_oi: -- (reset --)"));
     let unknown = listed_account(&stdout, "unknown");
     assert!(unknown.contains("[未確認]"));
-    assert!(unknown.contains("5h: -- (reset --)  7d: -- (reset --)  7d_oi: -- (reset --)"));
+    assert!(unknown.contains("5h: -- (reset --) 7d: -- (reset --) 7d_oi: -- (reset --)"));
+}
+
+#[test]
+fn list_orders_accounts_by_when_all_usage_limits_reset() {
+    let config = TempDir::new().unwrap();
+    register_list_fixture(
+        &config,
+        &[
+            "weekly",
+            "unknown",
+            "later",
+            "multi",
+            "ready",
+            "early",
+            "invalid",
+            "missing_reset",
+            "expired",
+            "retry",
+            "same",
+            "custom",
+        ],
+    );
+    let first_reset = 4102444800_u64;
+    for (name, snapshot) in [
+        (
+            "weekly",
+            serde_json::json!({
+                "blockedUntilUnixSecs": first_reset, "eligible": false,
+                "windows": {
+                    "5h": {"utilization": 0.0, "resetAtUnixSecs": first_reset},
+                    "7d": {"utilization": 1.02, "resetAtUnixSecs": first_reset + 86400}
+                }
+            }),
+        ),
+        (
+            "later",
+            serde_json::json!({
+                "eligible": false,
+                "windows": {"5h": {"utilization": 1.0, "resetAtUnixSecs": first_reset + 3600}}
+            }),
+        ),
+        (
+            "multi",
+            serde_json::json!({
+                "blockedUntilUnixSecs": first_reset, "eligible": false,
+                "windows": {
+                    "5h": {"utilization": 1.44, "resetAtUnixSecs": first_reset},
+                    "7d": {"utilization": 0.5, "resetAtUnixSecs": first_reset + 86400},
+                    "7d_oi": {"utilization": 0.99, "resetAtUnixSecs": first_reset + 7200}
+                }
+            }),
+        ),
+        (
+            "ready",
+            serde_json::json!({"active": true, "eligible": true, "windows": {"5h": {"utilization": 0.2}}}),
+        ),
+        (
+            "early",
+            serde_json::json!({
+                "eligible": false,
+                "windows": {
+                    "5h": {"utilization": 0.98, "resetAtUnixSecs": first_reset},
+                    "7d": {"utilization": 0.5, "resetAtUnixSecs": first_reset + 172800}
+                }
+            }),
+        ),
+        (
+            "invalid",
+            serde_json::json!({"invalid": true, "active": true}),
+        ),
+        (
+            "missing_reset",
+            serde_json::json!({"eligible": false, "windows": {
+                "5h": {"utilization": 1.0},
+                "7d": {"utilization": 1.0, "resetAtUnixSecs": first_reset}
+            }}),
+        ),
+        (
+            "expired",
+            serde_json::json!({
+                "eligible": false, "blockedUntilUnixSecs": 1,
+                "windows": {
+                    "5h": {"utilization": 1.0, "resetAtUnixSecs": 1},
+                    "7d": {"utilization": 0.4, "resetAtUnixSecs": first_reset}
+                }
+            }),
+        ),
+        (
+            "retry",
+            serde_json::json!({"eligible": false, "lastResponseStatus": 429, "blockedUntilUnixSecs": first_reset}),
+        ),
+        (
+            "same",
+            serde_json::json!({
+                "eligible": false,
+                "windows": {"5h": {"utilization": 1.0, "resetAtUnixSecs": first_reset + 3600}}
+            }),
+        ),
+        (
+            "custom",
+            serde_json::json!({
+                "switchThreshold": 0.9, "eligible": true,
+                "windows": {"5h": {"utilization": 0.95, "resetAtUnixSecs": first_reset + 5400}}
+            }),
+        ),
+    ] {
+        let mut snapshot = snapshot;
+        snapshot["account"] = serde_json::json!(name);
+        write_list_usage(&config, name, snapshot);
+    }
+    let output = anthropic_accounts_command(&config, &["list"])
+        .unwrap()
+        .env("TZ", "UTC")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let names: Vec<_> = stdout
+        .lines()
+        .filter_map(|line| line.split_once(". "))
+        .map(|(_, row)| row.split_whitespace().next().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "ready",
+            "expired",
+            "early",
+            "later",
+            "same",
+            "custom",
+            "multi",
+            "weekly",
+            "unknown",
+            "missing_reset",
+            "retry",
+            "invalid",
+        ]
+    );
+    for name in ["ready", "expired"] {
+        assert!(listed_account(&stdout, name).contains("利用可: 今すぐ"));
+    }
+    for (name, reset) in [
+        ("early", "2100/01/01 00:00"),
+        ("later", "2100/01/01 01:00"),
+        ("custom", "2100/01/01 01:30"),
+        ("multi", "2100/01/01 02:00"),
+        ("weekly", "2100/01/02 00:00"),
+    ] {
+        assert!(listed_account(&stdout, name).contains(&format!("利用可: {reset}")));
+    }
+    for name in ["unknown", "missing_reset", "retry"] {
+        assert!(listed_account(&stdout, name).contains("利用可: 不明"));
+    }
+    assert!(listed_account(&stdout, "invalid").contains("利用可: 要再認証"));
 }
 
 #[test]
@@ -246,7 +408,7 @@ fn list_expires_blocks_preserves_old_usage_and_identifies_invalid_credentials() 
     let recovered = listed_account(&stdout, "recovered");
     assert!(recovered.contains("[残あり]"));
     assert!(recovered.contains("5h: 100.0%* (reset "));
-    assert!(recovered.contains("  7d: 40.0% (reset "));
+    assert!(recovered.contains(" 7d: 40.0% (reset "));
     assert!(listed_account(&stdout, "invalid").contains("[認証無効]"));
     assert!(listed_account(&stdout, "old").contains("[未確認]"));
     assert!(stdout.contains("* はリセット時刻経過後の前回値"));
@@ -277,9 +439,12 @@ fn list_does_not_use_corrupt_or_mismatched_account_usage() {
     for name in ["corrupt", "mismatched"] {
         let row = listed_account(&stdout, name);
         assert!(row.contains("[未確認]"));
-        assert!(row.contains("5h: -- (reset --)  7d: -- (reset --)  7d_oi: -- (reset --)"));
+        assert!(row.contains("5h: -- (reset --) 7d: -- (reset --) 7d_oi: -- (reset --)"));
     }
-    assert!(listed_account(&stdout, "spare").contains("[残あり]  5h: 0.0%"));
+    let spare = listed_account(&stdout, "spare");
+    assert!(spare.contains("[残あり]"));
+    assert!(spare.contains("利用可: 今すぐ"));
+    assert!(spare.contains("5h: 0.0%"));
 }
 
 #[test]
