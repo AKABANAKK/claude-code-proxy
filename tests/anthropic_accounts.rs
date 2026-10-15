@@ -21,6 +21,14 @@ fn help_exposes_account_commands() {
         .stdout(contains("list"))
         .stdout(contains("update"))
         .stdout(contains("remove"));
+    Command::cargo_bin("claude-code-proxy")
+        .unwrap()
+        .args(["anthropic", "accounts", "list", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("[SORT]"))
+        .stdout(contains("registration order"))
+        .stdout(contains("resettime:asc"));
 }
 
 #[test]
@@ -117,6 +125,27 @@ fn listed_account(output: &str, name: &str) -> String {
         .join(" ")
 }
 
+fn listed_account_names(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter_map(|line| line.split_once(". "))
+        .map(|(_, row)| row.split_whitespace().next().unwrap())
+        .collect()
+}
+
+#[test]
+fn list_rejects_an_unsupported_sort_order() {
+    let config = TempDir::new().unwrap();
+    anthropic_accounts_command(&config, &["list", "resettime:invalid"])
+        .unwrap()
+        .assert()
+        .code(2)
+        .stderr(contains("invalid value"))
+        .stderr(contains("resettime:asc"));
+    assert!(!config.path().join("anthropic/accounts.json").exists());
+    assert!(!list_usage_directory(&config).exists());
+}
+
 #[test]
 fn update_without_registered_accounts_does_not_contact_upstream_or_create_usage() {
     let config = TempDir::new().unwrap();
@@ -179,25 +208,25 @@ fn list_shows_selection_reset_wait_and_remaining_usage_percentages() {
 }
 
 #[test]
-fn list_orders_accounts_by_when_all_usage_limits_reset() {
+fn list_preserves_registration_order_unless_resettime_sort_is_requested() {
     let config = TempDir::new().unwrap();
-    register_list_fixture(
-        &config,
-        &[
-            "weekly",
-            "unknown",
-            "later",
-            "multi",
-            "ready",
-            "early",
-            "invalid",
-            "missing_reset",
-            "expired",
-            "retry",
-            "same",
-            "custom",
-        ],
-    );
+    let registration_order = [
+        "weekly",
+        "unknown",
+        "later",
+        "multi",
+        "ready",
+        "early",
+        "invalid",
+        "missing_reset",
+        "expired",
+        "retry",
+        "same",
+        "custom",
+    ];
+    register_list_fixture(&config, &registration_order);
+    let registry = config.path().join("anthropic/accounts.json");
+    let registrations = std::fs::read(&registry).unwrap();
     let first_reset = 4102444800_u64;
     for (name, snapshot) in [
         (
@@ -286,20 +315,18 @@ fn list_orders_accounts_by_when_all_usage_limits_reset() {
         snapshot["account"] = serde_json::json!(name);
         write_list_usage(&config, name, snapshot);
     }
-    let output = anthropic_accounts_command(&config, &["list"])
+    let default_output = list_output(&config);
+    assert_eq!(listed_account_names(&default_output), registration_order);
+    assert!(!default_output.contains("日時不明のアカウントは末尾"));
+    let output = anthropic_accounts_command(&config, &["list", "resettime:asc"])
         .unwrap()
         .env("TZ", "UTC")
         .output()
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let names: Vec<_> = stdout
-        .lines()
-        .filter_map(|line| line.split_once(". "))
-        .map(|(_, row)| row.split_whitespace().next().unwrap())
-        .collect();
     assert_eq!(
-        names,
+        listed_account_names(&stdout),
         [
             "ready",
             "expired",
@@ -331,6 +358,12 @@ fn list_orders_accounts_by_when_all_usage_limits_reset() {
         assert!(listed_account(&stdout, name).contains("利用可: 不明"));
     }
     assert!(listed_account(&stdout, "invalid").contains("利用可: 要再認証"));
+    assert!(stdout.contains("日時不明のアカウントは末尾"));
+    assert_eq!(std::fs::read(registry).unwrap(), registrations);
+    assert_eq!(
+        listed_account_names(&list_output(&config)),
+        registration_order
+    );
 }
 
 #[test]
@@ -799,6 +832,7 @@ async fn update_keeps_previous_usage_on_failures_and_preserves_missing_windows()
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Updated usage for 2 of 6 Claude accounts"));
+    assert_eq!(listed_account_names(&stdout), names);
     assert!(listed_account(&stdout, "current").contains("[リセット待ち]"));
     assert!(listed_account(&stdout, "invalid").contains("[認証無効]"));
     let stderr = String::from_utf8(output.stderr).unwrap();

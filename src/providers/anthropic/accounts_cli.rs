@@ -32,11 +32,22 @@ pub enum AccountsCommand {
     /// Register a token from `claude setup-token` read from standard input
     Add { name: String },
     /// List registered accounts, selection status, observed usage, and reset times
-    List,
+    List {
+        /// Optional sort order; defaults to registration order
+        #[arg(value_enum, value_name = "SORT")]
+        sort: Option<AccountsListSort>,
+    },
     /// Fetch and save usage for all registered accounts, then show the updated list
     Update,
     /// Remove a registered account
     Remove { name: String },
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum AccountsListSort {
+    /// Earliest estimated recovery first; unknown times last
+    #[value(name = "resettime:asc")]
+    ResetTimeAsc,
 }
 
 impl Command {
@@ -68,7 +79,7 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
                 }
             }
         }
-        AccountsCommand::List => {
+        AccountsCommand::List { sort } => {
             let stored = store.load()?;
             if stored.accounts.is_empty() {
                 println!("No Claude accounts registered");
@@ -112,7 +123,9 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
                     (account, snapshot, active, availability)
                 })
                 .collect();
-            entries.sort_by_key(|(_, _, _, availability)| *availability);
+            if let Some(AccountsListSort::ResetTimeAsc) = sort {
+                entries.sort_by_key(|(_, _, _, availability)| *availability);
+            }
             let rows: Vec<_> = entries
                 .into_iter()
                 .enumerate()
@@ -163,7 +176,12 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
             println!(
                 "使用率は最後に取得した値です。-- は未取得、* はリセット時刻経過後の前回値です。"
             );
-            println!("利用可は保存情報からの目安です。日時不明のアカウントは末尾に表示します。");
+            match sort {
+                Some(AccountsListSort::ResetTimeAsc) => println!(
+                    "利用可は保存情報からの目安です。日時不明のアカウントは末尾に表示します。"
+                ),
+                None => println!("利用可は保存情報からの目安です。"),
+            }
             Ok(())
         }
         AccountsCommand::Update => {
@@ -178,7 +196,7 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
                 .build()?;
             let updated = runtime.block_on(update_account_usage(stored.accounts));
             println!("Updated usage for {updated} of {account_count} Claude accounts");
-            run_accounts(AccountsCommand::List)?;
+            run_accounts(AccountsCommand::List { sort: None })?;
             anyhow::ensure!(
                 updated == account_count,
                 "Failed to update usage for {} Claude accounts",
