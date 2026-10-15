@@ -26,9 +26,11 @@ fn help_exposes_account_commands() {
         .args(["anthropic", "accounts", "list", "--help"])
         .assert()
         .success()
-        .stdout(contains("[SORT]"))
+        .stdout(contains("[COLUMN:asc|desc]"))
         .stdout(contains("registration order"))
-        .stdout(contains("resettime:asc"));
+        .stdout(contains(
+            "name, status, available_at, 5h, 7d, 7d_oi, added_at",
+        ));
 }
 
 #[test]
@@ -133,17 +135,188 @@ fn listed_account_names(output: &str) -> Vec<&str> {
         .collect()
 }
 
+fn listed_cell<'a>(output: &'a str, name: &str, column: &str) -> &'a str {
+    let header = output
+        .lines()
+        .find(|line| line.starts_with("name "))
+        .unwrap();
+    let index = header
+        .split_whitespace()
+        .position(|name| name == column)
+        .unwrap();
+    let row = output
+        .lines()
+        .find(|line| {
+            line.split_once(". ")
+                .and_then(|(_, account)| account.strip_prefix(name))
+                .is_some_and(|remaining| remaining.trim_start().starts_with('['))
+        })
+        .unwrap();
+    row.split("  ")
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .nth(index)
+        .unwrap()
+}
+
 #[test]
 fn list_rejects_an_unsupported_sort_order() {
     let config = TempDir::new().unwrap();
-    anthropic_accounts_command(&config, &["list", "resettime:invalid"])
-        .unwrap()
-        .assert()
-        .code(2)
-        .stderr(contains("invalid value"))
-        .stderr(contains("resettime:asc"));
+    for sort in [
+        "name",
+        "name:invalid",
+        "missing:asc",
+        "name:asc:desc",
+        ":asc",
+    ] {
+        anthropic_accounts_command(&config, &["list", sort])
+            .unwrap()
+            .assert()
+            .code(2)
+            .stderr(contains("invalid value"))
+            .stderr(contains("<column>:asc or <column>:desc"))
+            .stderr(contains(
+                "name, status, available_at, 5h, 7d, 7d_oi, added_at",
+            ));
+    }
     assert!(!config.path().join("anthropic/accounts.json").exists());
     assert!(!list_usage_directory(&config).exists());
+}
+
+#[test]
+fn list_sorts_all_seven_displayed_columns_in_both_directions() {
+    let config = TempDir::new().unwrap();
+    let names = ["bravo", "unknown", "alpha", "tie", "charlie", "invalid"];
+    register_list_fixture(&config, &names);
+    let registry = config.path().join("anthropic/accounts.json");
+    let mut registrations: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+    for (account, added_at) in registrations["accounts"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .zip([5000, 2000, 6000, 6000, 1000, 4000])
+    {
+        account["addedAt"] = serde_json::json!(added_at);
+    }
+    std::fs::write(&registry, serde_json::to_vec(&registrations).unwrap()).unwrap();
+    let registrations = std::fs::read(&registry).unwrap();
+    let reset = 4102444800_u64;
+    for (name, active, five_hour, weekly, weekly_oi, delay) in [
+        ("bravo", false, 1.05, 0.2, 0.7, 300),
+        ("alpha", true, 0.09, 0.8, 0.2, 0),
+        ("tie", false, 0.09, 0.8, 0.2, 0),
+        ("charlie", false, 1.0, 0.1, 0.9, 100),
+    ] {
+        write_list_usage(
+            &config,
+            name,
+            serde_json::json!({
+                "account": name, "active": active, "eligible": five_hour < 0.98,
+                "windows": {
+                    "5h": {"utilization": five_hour, "resetAtUnixSecs": reset + delay},
+                    "7d": {"utilization": weekly, "resetAtUnixSecs": reset + delay},
+                    "7d_oi": {"utilization": weekly_oi, "resetAtUnixSecs": reset + delay}
+                }
+            }),
+        );
+    }
+    write_list_usage(
+        &config,
+        "invalid",
+        serde_json::json!({
+            "account": "invalid", "invalid": true,
+            "windows": {"5h": {"utilization": -1}, "7d": {"utilization": "bad"}}
+        }),
+    );
+    let default_output = list_output(&config);
+    assert_eq!(listed_account_names(&default_output), names);
+    assert_eq!(
+        default_output
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        [
+            "name",
+            "status",
+            "available_at",
+            "5h",
+            "7d",
+            "7d_oi",
+            "added_at"
+        ]
+    );
+    for (sort, expected) in [
+        (
+            "name:asc",
+            ["alpha", "bravo", "charlie", "invalid", "tie", "unknown"],
+        ),
+        (
+            "name:desc",
+            ["unknown", "tie", "invalid", "charlie", "bravo", "alpha"],
+        ),
+        (
+            "status:asc",
+            ["bravo", "charlie", "unknown", "tie", "alpha", "invalid"],
+        ),
+        (
+            "status:desc",
+            ["invalid", "alpha", "tie", "unknown", "bravo", "charlie"],
+        ),
+        (
+            "available_at:asc",
+            ["alpha", "tie", "charlie", "bravo", "unknown", "invalid"],
+        ),
+        (
+            "available_at:desc",
+            ["bravo", "charlie", "alpha", "tie", "unknown", "invalid"],
+        ),
+        (
+            "5h:asc",
+            ["alpha", "tie", "charlie", "bravo", "unknown", "invalid"],
+        ),
+        (
+            "5h:desc",
+            ["bravo", "charlie", "alpha", "tie", "unknown", "invalid"],
+        ),
+        (
+            "7d:asc",
+            ["charlie", "bravo", "alpha", "tie", "unknown", "invalid"],
+        ),
+        (
+            "7d:desc",
+            ["alpha", "tie", "bravo", "charlie", "unknown", "invalid"],
+        ),
+        (
+            "7d_oi:asc",
+            ["alpha", "tie", "bravo", "charlie", "unknown", "invalid"],
+        ),
+        (
+            "7d_oi:desc",
+            ["charlie", "bravo", "alpha", "tie", "unknown", "invalid"],
+        ),
+        (
+            "added_at:asc",
+            ["charlie", "unknown", "invalid", "bravo", "alpha", "tie"],
+        ),
+        (
+            "added_at:desc",
+            ["alpha", "tie", "bravo", "invalid", "unknown", "charlie"],
+        ),
+    ] {
+        let output = anthropic_accounts_command(&config, &["list", sort])
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{sort}: {output:?}");
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(listed_account_names(&output), expected, "{sort}");
+        assert!(!output.contains("private-test-token"));
+    }
+    assert_eq!(std::fs::read(registry).unwrap(), registrations);
+    assert_eq!(listed_account_names(&list_output(&config)), names);
 }
 
 #[test]
@@ -195,20 +368,26 @@ fn list_shows_selection_reset_wait_and_remaining_usage_percentages() {
     let stdout = list_output(&config);
     let current = listed_account(&stdout, "current");
     assert!(current.contains("[稼働中]"));
-    assert!(current.contains("5h: 12.3% (reset --) 7d: 56.8% (reset --) 7d_oi: 7.0% (reset --)"));
+    assert_eq!(listed_cell(&stdout, "current", "5h"), "12.3% (reset --)");
+    assert_eq!(listed_cell(&stdout, "current", "7d"), "56.8% (reset --)");
+    assert_eq!(listed_cell(&stdout, "current", "7d_oi"), "7.0% (reset --)");
     let waiting = listed_account(&stdout, "waiting");
     assert!(waiting.contains("[リセット待ち]"));
-    assert!(waiting.contains("5h: 101.0%"));
+    assert_eq!(listed_cell(&stdout, "waiting", "5h"), "101.0% (reset --)");
     let spare = listed_account(&stdout, "spare");
     assert!(spare.contains("[残あり]"));
-    assert!(spare.contains("5h: 40.0% (reset --) 7d: 80.0% (reset --) 7d_oi: -- (reset --)"));
+    assert_eq!(listed_cell(&stdout, "spare", "5h"), "40.0% (reset --)");
+    assert_eq!(listed_cell(&stdout, "spare", "7d"), "80.0% (reset --)");
+    assert_eq!(listed_cell(&stdout, "spare", "7d_oi"), "-- (reset --)");
     let unknown = listed_account(&stdout, "unknown");
     assert!(unknown.contains("[未確認]"));
-    assert!(unknown.contains("5h: -- (reset --) 7d: -- (reset --) 7d_oi: -- (reset --)"));
+    for column in ["5h", "7d", "7d_oi"] {
+        assert_eq!(listed_cell(&stdout, "unknown", column), "-- (reset --)");
+    }
 }
 
 #[test]
-fn list_preserves_registration_order_unless_resettime_sort_is_requested() {
+fn list_preserves_registration_order_unless_available_at_sort_is_requested() {
     let config = TempDir::new().unwrap();
     let registration_order = [
         "weekly",
@@ -317,8 +496,8 @@ fn list_preserves_registration_order_unless_resettime_sort_is_requested() {
     }
     let default_output = list_output(&config);
     assert_eq!(listed_account_names(&default_output), registration_order);
-    assert!(!default_output.contains("日時不明のアカウントは末尾"));
-    let output = anthropic_accounts_command(&config, &["list", "resettime:asc"])
+    assert!(!default_output.contains("ソート項目の未取得値は末尾"));
+    let output = anthropic_accounts_command(&config, &["list", "available_at:asc"])
         .unwrap()
         .env("TZ", "UTC")
         .output()
@@ -343,7 +522,7 @@ fn list_preserves_registration_order_unless_resettime_sort_is_requested() {
         ]
     );
     for name in ["ready", "expired"] {
-        assert!(listed_account(&stdout, name).contains("resettime: 今すぐ"));
+        assert_eq!(listed_cell(&stdout, name, "available_at"), "今すぐ");
     }
     for (name, reset) in [
         ("early", "2100/01/01 00:00"),
@@ -352,13 +531,13 @@ fn list_preserves_registration_order_unless_resettime_sort_is_requested() {
         ("multi", "2100/01/01 02:00"),
         ("weekly", "2100/01/02 00:00"),
     ] {
-        assert!(listed_account(&stdout, name).contains(&format!("resettime: {reset}")));
+        assert_eq!(listed_cell(&stdout, name, "available_at"), reset);
     }
     for name in ["unknown", "missing_reset", "retry"] {
-        assert!(listed_account(&stdout, name).contains("resettime: 不明"));
+        assert_eq!(listed_cell(&stdout, name, "available_at"), "不明");
     }
-    assert!(listed_account(&stdout, "invalid").contains("resettime: 要再認証"));
-    assert!(stdout.contains("日時不明のアカウントは末尾"));
+    assert_eq!(listed_cell(&stdout, "invalid", "available_at"), "要再認証");
+    assert!(stdout.contains("ソート項目の未取得値は末尾"));
     assert_eq!(std::fs::read(registry).unwrap(), registrations);
     assert_eq!(
         listed_account_names(&list_output(&config)),
@@ -440,8 +619,8 @@ fn list_expires_blocks_preserves_old_usage_and_identifies_invalid_credentials() 
     let stdout = list_output(&config);
     let recovered = listed_account(&stdout, "recovered");
     assert!(recovered.contains("[残あり]"));
-    assert!(recovered.contains("5h: 100.0%* (reset "));
-    assert!(recovered.contains(" 7d: 40.0% (reset "));
+    assert!(listed_cell(&stdout, "recovered", "5h").starts_with("100.0%* (reset "));
+    assert!(listed_cell(&stdout, "recovered", "7d").starts_with("40.0% (reset "));
     assert!(listed_account(&stdout, "invalid").contains("[認証無効]"));
     assert!(listed_account(&stdout, "old").contains("[未確認]"));
     assert!(stdout.contains("* はリセット時刻経過後の前回値"));
@@ -472,12 +651,14 @@ fn list_does_not_use_corrupt_or_mismatched_account_usage() {
     for name in ["corrupt", "mismatched"] {
         let row = listed_account(&stdout, name);
         assert!(row.contains("[未確認]"));
-        assert!(row.contains("5h: -- (reset --) 7d: -- (reset --) 7d_oi: -- (reset --)"));
+        for column in ["5h", "7d", "7d_oi"] {
+            assert_eq!(listed_cell(&stdout, name, column), "-- (reset --)");
+        }
     }
     let spare = listed_account(&stdout, "spare");
     assert!(spare.contains("[残あり]"));
-    assert!(spare.contains("resettime: 今すぐ"));
-    assert!(spare.contains("5h: 0.0%"));
+    assert_eq!(listed_cell(&stdout, "spare", "available_at"), "今すぐ");
+    assert!(listed_cell(&stdout, "spare", "5h").starts_with("0.0% (reset "));
 }
 
 #[test]
@@ -564,6 +745,9 @@ fn read_only_commands_do_not_create_or_overwrite_usage_snapshots() {
             vec!["models", "--full"],
             vec!["kimi", "auth", "status"],
             vec!["anthropic", "accounts", "list"],
+            vec!["anthropic", "accounts", "list", "name:asc"],
+            vec!["anthropic", "accounts", "list", "available_at:desc"],
+            vec!["anthropic", "accounts", "list", "5h:desc"],
         ] {
             let output = Command::cargo_bin("claude-code-proxy")
                 .unwrap()
@@ -739,7 +923,10 @@ async fn update_refreshes_all_accounts_and_preserves_selection() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Updated usage for 6 of 6 Claude accounts"));
     assert!(listed_account(&stdout, "second").contains("[稼働中]"));
-    assert!(stdout.contains("5h: 10.0% (reset 2100/01/01 00:00)"));
+    assert_eq!(
+        listed_cell(&stdout, "second", "5h"),
+        "10.0% (reset 2100/01/01 00:00)"
+    );
     assert_eq!(std::fs::read(registry).unwrap(), registrations);
     for name in names {
         let snapshot: serde_json::Value = serde_json::from_slice(

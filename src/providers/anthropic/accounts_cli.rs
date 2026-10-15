@@ -6,9 +6,11 @@ use clap::Subcommand;
 use futures_util::{StreamExt, stream};
 use jiff::{Timestamp, tz::TimeZone};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthStr;
 
@@ -34,7 +36,7 @@ pub enum AccountsCommand {
     /// List registered accounts, selection status, observed usage, and reset times
     List {
         /// Optional sort order; defaults to registration order
-        #[arg(value_enum, value_name = "SORT")]
+        #[arg(value_name = "COLUMN:asc|desc", long_help = accounts_sort_help())]
         sort: Option<AccountsListSort>,
     },
     /// Fetch and save usage for all registered accounts, then show the updated list
@@ -43,11 +45,141 @@ pub enum AccountsCommand {
     Remove { name: String },
 }
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-pub enum AccountsListSort {
-    /// Earliest estimated recovery first; unknown times last
-    #[value(name = "resettime:asc")]
-    ResetTimeAsc,
+#[derive(Clone, Copy, Debug)]
+enum AccountColumn {
+    Name,
+    Status,
+    AvailableAt,
+    FiveHour,
+    SevenDay,
+    SevenDayOi,
+    AddedAt,
+}
+
+impl AccountColumn {
+    const ALL: [Self; 7] = [
+        Self::Name,
+        Self::Status,
+        Self::AvailableAt,
+        Self::FiveHour,
+        Self::SevenDay,
+        Self::SevenDayOi,
+        Self::AddedAt,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Status => "status",
+            Self::AvailableAt => "available_at",
+            Self::FiveHour => "5h",
+            Self::SevenDay => "7d",
+            Self::SevenDayOi => "7d_oi",
+            Self::AddedAt => "added_at",
+        }
+    }
+}
+
+fn accounts_sort_help() -> String {
+    format!(
+        "Sort by <column>:asc or <column>:desc; defaults to registration order.\n\
+         Columns: {}.\n\
+         Usage columns sort numerically, dates chronologically, and name/status by text.\n\
+         Unknown values stay last in both directions; ties retain registration order.",
+        AccountColumn::ALL.map(AccountColumn::name).join(", ")
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AccountsListSort {
+    column: AccountColumn,
+    descending: bool,
+}
+
+impl FromStr for AccountsListSort {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let error = || {
+            format!(
+                "expected <column>:asc or <column>:desc; columns: {}",
+                AccountColumn::ALL.map(AccountColumn::name).join(", ")
+            )
+        };
+        let (column, direction) = value.split_once(':').ok_or_else(error)?;
+        let column = AccountColumn::ALL
+            .into_iter()
+            .find(|candidate| candidate.name() == column)
+            .ok_or_else(error)?;
+        let descending = match direction {
+            "asc" => false,
+            "desc" => true,
+            _ => return Err(error()),
+        };
+        Ok(Self { column, descending })
+    }
+}
+
+struct AccountListEntry<'a> {
+    account: &'a accounts::StoredAnthropicAccount,
+    snapshot: Option<&'a Value>,
+    status: &'static str,
+    availability: AccountAvailability,
+}
+
+impl AccountsListSort {
+    fn compare(self, left: &AccountListEntry<'_>, right: &AccountListEntry<'_>) -> Ordering {
+        let compare_window = |window| {
+            compare_sort_values(
+                window_utilization(left.snapshot, window),
+                window_utilization(right.snapshot, window),
+                self.descending,
+            )
+        };
+        match self.column {
+            AccountColumn::Name => compare_sort_values(
+                Some(left.account.name.as_str()),
+                Some(right.account.name.as_str()),
+                self.descending,
+            ),
+            AccountColumn::Status => {
+                compare_sort_values(Some(left.status), Some(right.status), self.descending)
+            }
+            AccountColumn::AvailableAt => compare_sort_values(
+                left.availability.timestamp(),
+                right.availability.timestamp(),
+                self.descending,
+            )
+            .then_with(|| {
+                matches!(left.availability, AccountAvailability::Invalid)
+                    .cmp(&matches!(right.availability, AccountAvailability::Invalid))
+            }),
+            AccountColumn::FiveHour => compare_window("5h"),
+            AccountColumn::SevenDay => compare_window("7d"),
+            AccountColumn::SevenDayOi => compare_window("7d_oi"),
+            AccountColumn::AddedAt => compare_sort_values(
+                Some(left.account.added_at),
+                Some(right.account.added_at),
+                self.descending,
+            ),
+        }
+    }
+}
+
+fn compare_sort_values<T: PartialOrd>(
+    left: Option<T>,
+    right: Option<T>,
+    descending: bool,
+) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            let order = left.partial_cmp(&right).unwrap_or(Ordering::Equal);
+            if descending { order.reverse() } else { order }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 impl Command {
@@ -120,43 +252,51 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
                         .and_then(|snapshot| snapshot["active"].as_bool())
                         .unwrap_or_else(|| legacy_active.as_deref() == Some(account.name.as_str()));
                     let availability = account_availability(snapshot, active, now, threshold);
-                    (account, snapshot, active, availability)
-                })
-                .collect();
-            if let Some(AccountsListSort::ResetTimeAsc) = sort {
-                entries.sort_by_key(|(_, _, _, availability)| *availability);
-            }
-            let rows: Vec<_> = entries
-                .into_iter()
-                .enumerate()
-                .map(|(index, (account, snapshot, active, availability))| {
                     let status = match availability {
                         AccountAvailability::ResetsAt(_) => "リセット待ち",
                         _ => account_status(snapshot, active, now),
                     };
-                    [
-                        format!("{}. {}", index + 1, account.name),
-                        format!("[{status}]"),
-                        format_account_availability(availability, &time_zone),
-                        format!(
-                            "5h: {} (reset {})",
-                            format_window_usage(snapshot, "5h", now),
-                            format_window_reset_date(snapshot, "5h", &time_zone),
-                        ),
-                        format!(
-                            "7d: {} (reset {})",
-                            format_window_usage(snapshot, "7d", now),
-                            format_window_reset_date(snapshot, "7d", &time_zone),
-                        ),
-                        format!(
-                            "7d_oi: {} (reset {})",
-                            format_window_usage(snapshot, "7d_oi", now),
-                            format_window_reset_date(snapshot, "7d_oi", &time_zone),
-                        ),
-                        format!("added {}", format_account_added_date(account.added_at)),
-                    ]
+                    AccountListEntry {
+                        account,
+                        snapshot,
+                        status,
+                        availability,
+                    }
                 })
                 .collect();
+            if let Some(sort) = sort {
+                entries.sort_by(|left, right| sort.compare(left, right));
+            }
+            let mut rows = vec![AccountColumn::ALL.map(|column| column.name().to_owned())];
+            rows.extend(entries.into_iter().enumerate().map(|(index, entry)| {
+                let AccountListEntry {
+                    account,
+                    snapshot,
+                    status,
+                    availability,
+                } = entry;
+                [
+                    format!("{}. {}", index + 1, account.name),
+                    format!("[{status}]"),
+                    format_account_availability(availability, &time_zone),
+                    format!(
+                        "{} (reset {})",
+                        format_window_usage(snapshot, "5h", now),
+                        format_window_reset_date(snapshot, "5h", &time_zone),
+                    ),
+                    format!(
+                        "{} (reset {})",
+                        format_window_usage(snapshot, "7d", now),
+                        format_window_reset_date(snapshot, "7d", &time_zone),
+                    ),
+                    format!(
+                        "{} (reset {})",
+                        format_window_usage(snapshot, "7d_oi", now),
+                        format_window_reset_date(snapshot, "7d_oi", &time_zone),
+                    ),
+                    format_account_added_date(account.added_at),
+                ]
+            }));
             // Terminal cell widths keep Japanese names and statuses aligned too.
             let widths: [usize; 7] = std::array::from_fn(|column| {
                 rows.iter()
@@ -176,11 +316,9 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
             println!(
                 "使用率は最後に取得した値です。-- は未取得、* はリセット時刻経過後の前回値です。"
             );
-            match sort {
-                Some(AccountsListSort::ResetTimeAsc) => println!(
-                    "resettime は保存情報からの目安です。日時不明のアカウントは末尾に表示します。"
-                ),
-                None => println!("resettime は保存情報からの目安です。"),
+            println!("available_at は保存情報からの利用再開時刻の目安です。");
+            if sort.is_some() {
+                println!("ソート項目の未取得値は末尾に表示します。");
             }
             Ok(())
         }
@@ -305,6 +443,16 @@ enum AccountAvailability {
     Invalid,
 }
 
+impl AccountAvailability {
+    fn timestamp(self) -> Option<u64> {
+        match self {
+            Self::Now => Some(0),
+            Self::ResetsAt(timestamp) => Some(timestamp),
+            Self::Unknown | Self::Invalid => None,
+        }
+    }
+}
+
 fn account_availability(
     snapshot: Option<&Value>,
     active: bool,
@@ -361,13 +509,12 @@ fn account_availability(
 }
 
 fn format_account_availability(availability: AccountAvailability, time_zone: &TimeZone) -> String {
-    let value = match availability {
+    match availability {
         AccountAvailability::Now => "今すぐ".into(),
         AccountAvailability::ResetsAt(reset) => format_local_date(Some(reset), time_zone),
         AccountAvailability::Unknown => "不明".into(),
         AccountAvailability::Invalid => "要再認証".into(),
-    };
-    format!("resettime: {value}")
+    }
 }
 
 fn account_status(snapshot: Option<&Value>, active: bool, now: u64) -> &'static str {
@@ -406,17 +553,20 @@ fn format_window_usage(snapshot: Option<&Value>, window: &str, now: u64) -> Stri
     let Some(usage) = snapshot.map(|snapshot| &snapshot["windows"][window]) else {
         return "--".into();
     };
-    let Some(percent) = usage["utilization"]
-        .as_f64()
-        .map(|value| value * 100.0)
-        .filter(|value| value.is_finite() && *value >= 0.0)
-    else {
+    let Some(utilization) = window_utilization(snapshot, window) else {
         return "--".into();
     };
+    let percent = utilization * 100.0;
     let stale = usage["resetAtUnixSecs"]
         .as_u64()
         .is_some_and(|reset| reset <= now);
     format!("{percent:.1}%{}", if stale { "*" } else { "" })
+}
+
+fn window_utilization(snapshot: Option<&Value>, window: &str) -> Option<f64> {
+    snapshot?["windows"][window]["utilization"]
+        .as_f64()
+        .filter(|value| *value >= 0.0 && (value * 100.0).is_finite())
 }
 
 fn format_window_reset_date(
