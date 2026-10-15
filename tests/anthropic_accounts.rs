@@ -343,7 +343,7 @@ fn list_preserves_registration_order_unless_resettime_sort_is_requested() {
         ]
     );
     for name in ["ready", "expired"] {
-        assert!(listed_account(&stdout, name).contains("利用可: 今すぐ"));
+        assert!(listed_account(&stdout, name).contains("resettime: 今すぐ"));
     }
     for (name, reset) in [
         ("early", "2100/01/01 00:00"),
@@ -352,12 +352,12 @@ fn list_preserves_registration_order_unless_resettime_sort_is_requested() {
         ("multi", "2100/01/01 02:00"),
         ("weekly", "2100/01/02 00:00"),
     ] {
-        assert!(listed_account(&stdout, name).contains(&format!("利用可: {reset}")));
+        assert!(listed_account(&stdout, name).contains(&format!("resettime: {reset}")));
     }
     for name in ["unknown", "missing_reset", "retry"] {
-        assert!(listed_account(&stdout, name).contains("利用可: 不明"));
+        assert!(listed_account(&stdout, name).contains("resettime: 不明"));
     }
-    assert!(listed_account(&stdout, "invalid").contains("利用可: 要再認証"));
+    assert!(listed_account(&stdout, "invalid").contains("resettime: 要再認証"));
     assert!(stdout.contains("日時不明のアカウントは末尾"));
     assert_eq!(std::fs::read(registry).unwrap(), registrations);
     assert_eq!(
@@ -476,7 +476,7 @@ fn list_does_not_use_corrupt_or_mismatched_account_usage() {
     }
     let spare = listed_account(&stdout, "spare");
     assert!(spare.contains("[残あり]"));
-    assert!(spare.contains("利用可: 今すぐ"));
+    assert!(spare.contains("resettime: 今すぐ"));
     assert!(spare.contains("5h: 0.0%"));
 }
 

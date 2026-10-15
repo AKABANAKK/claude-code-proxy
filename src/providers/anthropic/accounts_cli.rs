@@ -178,9 +178,9 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
             );
             match sort {
                 Some(AccountsListSort::ResetTimeAsc) => println!(
-                    "利用可は保存情報からの目安です。日時不明のアカウントは末尾に表示します。"
+                    "resettime は保存情報からの目安です。日時不明のアカウントは末尾に表示します。"
                 ),
-                None => println!("利用可は保存情報からの目安です。"),
+                None => println!("resettime は保存情報からの目安です。"),
             }
             Ok(())
         }
@@ -367,7 +367,7 @@ fn format_account_availability(availability: AccountAvailability, time_zone: &Ti
         AccountAvailability::Unknown => "不明".into(),
         AccountAvailability::Invalid => "要再認証".into(),
     };
-    format!("利用可: {value}")
+    format!("resettime: {value}")
 }
 
 fn account_status(snapshot: Option<&Value>, active: bool, now: u64) -> &'static str {

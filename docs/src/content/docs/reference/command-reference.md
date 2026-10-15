@@ -107,10 +107,11 @@ visible. Equal recovery times retain registration order. Sorting changes only
 the displayed order; it does not change registrations or account selection.
 Recovery waits for all exhausted windows, so a weekly limit can keep an account
 blocked after its five-hour window resets.
-The aligned `利用可` column shows `今すぐ`, the estimated recovery time, `不明`,
-or `要再認証`. A retry deadline without quota-window data is not treated as a
-known reset time. Reset times use `yyyy/mm/dd hh:mm`
-in the system's local time zone; `--` means the reset time is unknown.
+The aligned `resettime` column matches the sort key and shows `今すぐ`, the
+estimated recovery time, `不明`, or `要再認証`. A retry deadline without
+quota-window data is not treated as a known reset time. Reset times use
+`yyyy/mm/dd hh:mm` in the system's local time zone; `--` means the reset time is
+unknown.
 Status labels are `稼働中` (selected),
 `リセット待ち` (blocked until recovery), and `残あり` (available with observed usage).
 Unobserved accounts show `未確認`, and invalid credentials show `認証無効`.
