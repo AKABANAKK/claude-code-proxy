@@ -47,7 +47,11 @@ pub fn login<S: AuthStorage<StoredAuth>>(store: &GrokTokenStore<S>) -> anyhow::R
     let auth_url = authorize_url(&discovery, &redirect_uri, &pkce, &state)?;
 
     println!("Open this URL in your browser to authorize:\n\n  {auth_url}\n");
-    if let Err(err) = open_browser(&auth_url) {
+    if let Err(err) = open_browser(
+        &auth_url,
+        std::env::consts::OS,
+        std::process::Command::spawn,
+    ) {
         println!("Could not open browser automatically: {err}");
     }
     let code = wait_for_callback(&listener, &state, LOGIN_TIMEOUT)?;
@@ -282,27 +286,28 @@ fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = stream.write_all(response.as_bytes());
 }
 
-fn open_browser(url: &str) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    let command = ("open", vec![url]);
-    #[cfg(target_os = "linux")]
-    let command = ("xdg-open", vec![url]);
-    #[cfg(target_os = "windows")]
-    let command = windows_browser_command(url);
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-    {
-        std::process::Command::new(command.0)
-            .args(command.1)
-            .spawn()?;
-    }
+fn open_browser(
+    url: &str,
+    platform: &str,
+    execute: impl FnOnce(&mut std::process::Command) -> std::io::Result<std::process::Child>,
+) -> anyhow::Result<()> {
+    let command = match platform {
+        "macos" => ("open", vec![url]),
+        "linux" => ("xdg-open", vec![url]),
+        "windows" => windows_browser_command(url),
+        _ => return Ok(()),
+    };
+    execute(std::process::Command::new(command.0).args(command.1))?;
     Ok(())
 }
 
-#[cfg(any(windows, test))]
 fn windows_browser_command(url: &str) -> (&str, Vec<&str>) {
     // Keep URL metacharacters out of a command interpreter.
     ("rundll32.exe", vec!["url.dll,FileProtocolHandler", url])
 }
+
+#[cfg(test)]
+use open_browser as open_login_url;
 
 #[cfg(test)]
 #[path = "../../../../tests/support/oauth_browser_launch.rs"]
