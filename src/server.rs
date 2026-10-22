@@ -1535,6 +1535,20 @@ async fn dispatch_request(
         }
     };
 
+    if let Some(thread) = body.extra.remove("thread")
+        && thread.get("type").and_then(Value::as_str) != Some("create")
+    {
+        let message = "capability_rejected: beta_header:message-threads-2026-08-12";
+        let response = json_error(StatusCode::BAD_REQUEST, "invalid_request_error", message);
+        monitor_failed(
+            state.monitor.as_ref(),
+            &req_id,
+            Some(response.status()),
+            message,
+        );
+        return with_request_id(response, &req_id);
+    }
+
     if let Some(project) = project::name_from_request(
         body.extra.get("system"),
         body.messages.iter().rev().map(|message| &message.content),
