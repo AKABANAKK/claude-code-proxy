@@ -341,9 +341,8 @@ fn open_cursor_login_url(url: &str) -> anyhow::Result<()> {
     let status = if cfg!(target_os = "macos") {
         std::process::Command::new("open").arg(url).status()?
     } else if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
-            .status()?
+        let (program, args) = windows_browser_command(url);
+        std::process::Command::new(program).args(args).status()?
     } else {
         std::process::Command::new("xdg-open").arg(url).status()?
     };
@@ -352,6 +351,15 @@ fn open_cursor_login_url(url: &str) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+fn windows_browser_command(url: &str) -> (&str, Vec<&str>) {
+    // Keep URL metacharacters out of a command interpreter.
+    ("rundll32.exe", vec!["url.dll,FileProtocolHandler", url])
+}
+
+#[cfg(test)]
+#[path = "../../../tests/support/oauth_browser_launch.rs"]
+mod browser_launch_tests;
 
 fn random_base64_url(len: usize) -> String {
     let mut bytes = vec![0u8; len];
