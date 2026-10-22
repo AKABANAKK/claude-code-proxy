@@ -309,7 +309,9 @@ fn windows_browser_command(url: &str) -> (&str, Vec<&str>) {
 #[cfg(test)]
 use open_browser as open_login_url;
 
+// Run the shared assertions against each provider's private launcher.
 #[cfg(test)]
+#[allow(clippy::duplicate_mod)]
 #[path = "../../../../tests/support/oauth_browser_launch.rs"]
 mod browser_launch_tests;
 
