@@ -599,6 +599,16 @@ async fn message_thread_unknown_type_is_rejected_before_dispatch() {
 }
 
 #[tokio::test]
+async fn message_thread_missing_type_is_rejected_before_dispatch() {
+    assert_message_thread_rejected(json!({
+        "model": "gpt-5.5",
+        "messages": [{"role": "user", "content": "hello"}],
+        "thread": {}
+    }))
+    .await;
+}
+
+#[tokio::test]
 async fn message_thread_create_tool_result_dispatches_without_thread() {
     assert_message_thread_dispatched(json!({
         "model": "gpt-5.5",
