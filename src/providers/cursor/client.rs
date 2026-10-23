@@ -516,16 +516,10 @@ fn build_run_frames(
     request.extend(field_bytes(2, &action));
     request.extend(field_bytes(4, &[]));
     request.extend(field_string(5, &conversation_id));
-    request.extend(field_bytes(
-        9,
-        &model_message(resolved),
-    ));
+    request.extend(field_bytes(9, &model_message(resolved)));
     request.extend(field_varint(12, 0));
     request.extend(field_bytes(14, &field_string(1, "default")));
-    request.extend(field_bytes(
-        14,
-        &model_message(resolved),
-    ));
+    request.extend(field_bytes(14, &model_message(resolved)));
     request.extend(field_string(16, &conversation_id));
     let first = encode_connect_frame(field_bytes(1, &request), 0);
 

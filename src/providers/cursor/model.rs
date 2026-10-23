@@ -138,7 +138,10 @@ fn is_effort(value: &str) -> bool {
 }
 
 fn matches_family(raw: &str, id: &str) -> bool {
-    raw == id || raw.strip_prefix(id).is_some_and(|rest| rest.starts_with('-'))
+    raw == id
+        || raw
+            .strip_prefix(id)
+            .is_some_and(|rest| rest.starts_with('-'))
 }
 
 fn find_family(raw: &str) -> Option<&'static ParameterFamily> {
@@ -361,29 +364,37 @@ mod tests {
         assert_eq!(resolution.model_id, "claude-opus-5-5");
         assert!(resolution.fast);
         assert!(resolution.send_fast);
-        assert!(resolution
-            .parameters
-            .iter()
-            .any(|(key, value)| key == "effort" && value == "medium"));
-        assert!(resolution
-            .parameters
-            .iter()
-            .any(|(key, value)| key == "context" && value == "300k"));
+        assert!(
+            resolution
+                .parameters
+                .iter()
+                .any(|(key, value)| key == "effort" && value == "medium")
+        );
+        assert!(
+            resolution
+                .parameters
+                .iter()
+                .any(|(key, value)| key == "context" && value == "300k")
+        );
     }
 
     #[test]
     fn fable_high_is_not_the_thinking_variant() {
         let plain = resolve_cursor_model("cursor:claude-fable-5-1-high").unwrap();
         assert_eq!(plain.model_id, "claude-fable-5-1");
-        assert!(plain
-            .parameters
-            .iter()
-            .any(|(key, value)| key == "thinking" && value == "false"));
+        assert!(
+            plain
+                .parameters
+                .iter()
+                .any(|(key, value)| key == "thinking" && value == "false")
+        );
         let thinking = resolve_cursor_model("cursor:claude-fable-5-1-thinking-high").unwrap();
-        assert!(thinking
-            .parameters
-            .iter()
-            .any(|(key, value)| key == "thinking" && value == "true"));
+        assert!(
+            thinking
+                .parameters
+                .iter()
+                .any(|(key, value)| key == "thinking" && value == "true")
+        );
     }
 
     #[test]
