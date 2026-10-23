@@ -15,7 +15,7 @@ use http_body_util::BodyExt;
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
 
-static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static ENV_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
 
 // ---------------------------------------------------------------------------
 // Prost roundtrip
@@ -141,7 +141,7 @@ fn connect_frame_with_flags_decode() {
 
 #[test]
 fn auth_returns_token_from_env() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.blocking_lock();
     unsafe {
         std::env::set_var("CCP_CURSOR_AUTH_TOKEN", "test-token-123");
     }
@@ -262,7 +262,6 @@ fn cursor_error_display_works() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)]
 async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
     use axum::{Router, routing::post};
     use claude_code_proxy::providers::cursor::client::CursorHttpClient;
@@ -280,7 +279,7 @@ async fn cursor_client_sends_connect_proto_headers_and_run_request_frame() {
         body: Vec<u8>,
     }
 
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ENV_LOCK.lock().await;
     let observed: Arc<Mutex<Option<ObservedRequest>>> = Arc::new(Mutex::new(None));
     let observed_handler = Arc::clone(&observed);
 
@@ -698,7 +697,6 @@ fn registry_provider_for_legacy_cursor_model() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
 async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
     use axum::{Router, routing::post};
     use claude_code_proxy::providers::cursor::connect::encode_connect_frame;
@@ -707,7 +705,7 @@ async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
     use claude_code_proxy::providers::cursor::sse::frame_cursor_stream;
     use prost::Message;
 
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ENV_LOCK.lock().await;
 
     // Build mock upstream response bytes
     let mut body = Vec::new();
@@ -824,14 +822,13 @@ async fn cursor_provider_streams_text_and_usage_from_mock_upstream() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
 async fn cursor_provider_handle_messages_returns_anthropic_json() {
     use axum::{Router, routing::post};
     use claude_code_proxy::providers::cursor::connect::encode_connect_frame;
     use claude_code_proxy::providers::cursor::proto::*;
     use prost::Message;
 
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ENV_LOCK.lock().await;
 
     // Build mock response
     let mut body = Vec::new();
@@ -925,7 +922,6 @@ async fn cursor_provider_handle_messages_returns_anthropic_json() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)]
 async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
     use axum::{Router, routing::post};
     use claude_code_proxy::providers::cursor::connect::{
@@ -941,7 +937,7 @@ async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
         body: Vec<u8>,
     }
 
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ENV_LOCK.lock().await;
     let observed: Arc<Mutex<Option<ObservedRequest>>> = Arc::new(Mutex::new(None));
     let observed_handler = Arc::clone(&observed);
 
@@ -1116,7 +1112,7 @@ async fn live_run_answers_the_tool_result_on_the_same_stream() {
     use prost::Message;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ENV_LOCK.lock().await;
     let runs = Arc::new(AtomicUsize::new(0));
     let replies: Arc<Mutex<Vec<ExecClientMessage>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -1298,7 +1294,7 @@ async fn live_run_still_answers_plain_turns() {
     use claude_code_proxy::providers::cursor::connect::encode_connect_frame;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ENV_LOCK.lock().await;
     let runs = Arc::new(AtomicUsize::new(0));
 
     let app = {

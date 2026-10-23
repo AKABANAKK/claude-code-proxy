@@ -451,17 +451,20 @@ fn model_parameter(id: &str, value: &str) -> Vec<u8> {
     parameter
 }
 
-fn model_message(model: &str, fast: bool) -> Vec<u8> {
-    let mut out = field_string(1, model);
-    // grok-4.7's 500k window is max mode on the same id (AvailableModels, 2026-10-13).
-    if model == "grok-4.7" {
+fn model_message(resolved: &CursorModelResolution) -> Vec<u8> {
+    let mut out = field_string(1, &resolved.model_id);
+    // Grok 4.7 exposes its 500k window through max mode.
+    if resolved.model_id == "grok-4.7" {
         out.extend(field_varint(2, 1));
         out.extend(field_bytes(3, &model_parameter("context", "500k")));
     }
-    out.extend(field_bytes(
-        3,
-        &model_parameter("fast", if fast { "true" } else { "false" }),
-    ));
+    for (id, value) in &resolved.parameters {
+        out.extend(field_bytes(3, &model_parameter(id, value)));
+    }
+    if resolved.send_fast {
+        let value = if resolved.fast { "true" } else { "false" };
+        out.extend(field_bytes(3, &model_parameter("fast", value)));
+    }
     out
 }
 
@@ -513,16 +516,10 @@ fn build_run_frames(
     request.extend(field_bytes(2, &action));
     request.extend(field_bytes(4, &[]));
     request.extend(field_string(5, &conversation_id));
-    request.extend(field_bytes(
-        9,
-        &model_message(&resolved.model_id, resolved.fast),
-    ));
+    request.extend(field_bytes(9, &model_message(resolved)));
     request.extend(field_varint(12, 0));
     request.extend(field_bytes(14, &field_string(1, "default")));
-    request.extend(field_bytes(
-        14,
-        &model_message(&resolved.model_id, resolved.fast),
-    ));
+    request.extend(field_bytes(14, &model_message(resolved)));
     request.extend(field_string(16, &conversation_id));
     let first = encode_connect_frame(field_bytes(1, &request), 0);
 
@@ -736,7 +733,7 @@ mod model_message_tests {
 
     #[test]
     fn grok_4_7_requests_max_mode_500k() {
-        let msg = model_message("grok-4.7", false);
+        let msg = model_message(&wire("grok-4.7"));
         let text = String::from_utf8_lossy(&msg);
         assert!(text.contains("grok-4.7"));
         assert!(text.contains("context"));
@@ -748,11 +745,36 @@ mod model_message_tests {
 
     #[test]
     fn other_models_do_not_request_max_mode() {
-        let msg = model_message("composer-2.5", true);
+        let msg = model_message(&wire("composer-2.5-fast"));
         let text = String::from_utf8_lossy(&msg);
         assert!(text.contains("composer-2.5"));
         assert!(text.contains("true"));
         assert!(!text.contains("500k"));
         assert!(!msg.windows(2).any(|pair| pair == [0x10, 0x01]));
+    }
+
+    fn wire(model: &str) -> CursorModelResolution {
+        crate::providers::cursor::model::resolve_cursor_model(&format!("cursor:{model}")).unwrap()
+    }
+
+    #[test]
+    fn sonnet_5_5_medium_omits_fast() {
+        let msg = model_message(&wire("claude-sonnet-5-5-medium"));
+        let text = String::from_utf8_lossy(&msg);
+        assert!(text.contains("claude-sonnet-5-5"));
+        assert!(text.contains("reasoning_effort"));
+        assert!(text.contains("medium"));
+        assert!(text.contains("300k"));
+        assert!(!text.contains("fast"));
+    }
+
+    #[test]
+    fn composer_fast_still_sends_fast() {
+        let msg = model_message(&wire("composer-2.5-fast"));
+        let text = String::from_utf8_lossy(&msg);
+        assert!(text.contains("composer-2.5"));
+        assert!(text.contains("fast"));
+        assert!(text.contains("true"));
+        assert!(!text.contains("300k"));
     }
 }
