@@ -3,6 +3,24 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## v0.1.46 (2026-10-23)
+
+- Cursor models can read and write files and run shell commands without stopping
+  after one reply, displaying tool calls as text, or repeating completed calls.
+  ([#166](https://github.com/raine/claude-code-proxy/issues/166),
+  [#179](https://github.com/raine/claude-code-proxy/pull/179))
+- Cursor models receive instructions for calling MCP and other client tools,
+  including tools discovered through tool search.
+  ([#179](https://github.com/raine/claude-code-proxy/pull/179))
+- Cursor file reads no longer expose display line numbers that models could
+  accidentally copy into files they write.
+  ([#179](https://github.com/raine/claude-code-proxy/pull/179))
+- Cursor context usage no longer appears inflated after tool calls.
+  ([#179](https://github.com/raine/claude-code-proxy/pull/179))
+- Cursor model effort variants, such as `cursor:claude-sonnet-5-5-medium`,
+  now use the correct settings instead of failing with model-not-found errors.
+  ([#193](https://github.com/raine/claude-code-proxy/pull/193))
+
 ## v0.1.45 (2026-10-10)
 
 - Codex users can request the ultrafast service tier with
