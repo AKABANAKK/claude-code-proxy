@@ -10,6 +10,7 @@ use super::pkce::{
 };
 
 const BROWSER_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Config
@@ -116,7 +117,19 @@ pub fn run_browser_login_with_config(
 
         match listener.accept() {
             Ok((mut stream, _)) => {
-                match handle_callback(&mut stream, &config.issuer, &redirect_uri, &pkce, &state) {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    anyhow::bail!("OAuth timeout");
+                }
+                let read_timeout = remaining.min(CALLBACK_READ_TIMEOUT);
+                match handle_callback_with_timeout(
+                    &mut stream,
+                    &config.issuer,
+                    &redirect_uri,
+                    &pkce,
+                    &state,
+                    read_timeout,
+                ) {
                     // Ignore unrelated or malformed requests and keep waiting for
                     // the actual OAuth callback.
                     Ok(None) => continue,
@@ -134,6 +147,7 @@ pub fn run_browser_login_with_config(
     }
 }
 
+#[cfg(test)]
 fn handle_callback(
     stream: &mut TcpStream,
     issuer: &str,
@@ -141,8 +155,26 @@ fn handle_callback(
     pkce: &PkceCodes,
     state: &str,
 ) -> Result<Option<TokenResponse>, anyhow::Error> {
+    handle_callback_with_timeout(
+        stream,
+        issuer,
+        redirect_uri,
+        pkce,
+        state,
+        CALLBACK_READ_TIMEOUT,
+    )
+}
+
+fn handle_callback_with_timeout(
+    stream: &mut TcpStream,
+    issuer: &str,
+    redirect_uri: &str,
+    pkce: &PkceCodes,
+    state: &str,
+    read_timeout: Duration,
+) -> Result<Option<TokenResponse>, anyhow::Error> {
     let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(read_timeout));
 
     let (path, query) = match extract_request_path_and_query(stream) {
         Some(pair) => pair,
@@ -203,6 +235,7 @@ fn handle_callback(
 mod tests {
     use super::*;
     use crate::providers::codex::auth::test_http;
+    use std::io::{Read, Write};
     use std::sync::Arc;
 
     /// A minimal TCP-based mock auth server for browser login tests.
@@ -267,6 +300,36 @@ mod tests {
         assert!(
             response.contains("Not found"),
             "unexpected response: {response}"
+        );
+    }
+
+    #[test]
+    fn callback_read_timeout_bounds_silent_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handle_callback_with_timeout(
+                &mut stream,
+                "http://fake-issuer",
+                "http://localhost:1455/auth/callback",
+                &PkceCodes {
+                    verifier: "v".into(),
+                    challenge: "c".into(),
+                },
+                "test_state",
+                Duration::from_millis(100),
+            )
+        });
+
+        let started = std::time::Instant::now();
+        let _silent_client = TcpStream::connect(addr).unwrap();
+        let result = handle.join().unwrap();
+        assert!(matches!(result, Ok(None)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "silent connection exceeded its read timeout: {:?}",
+            started.elapsed()
         );
     }
 
@@ -480,8 +543,8 @@ mod tests {
     }
 
     #[test]
-    fn browser_login_ignores_non_callback_request() {
-        // A non-callback request must not terminate an in-flight login.
+    fn browser_login_ignores_non_callback_requests_until_oauth_error() {
+        // Malformed and unrelated requests must not terminate an in-flight login.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -489,7 +552,7 @@ mod tests {
         let config = BrowserLoginConfig {
             issuer: "http://fake-issuer".into(),
             port,
-            timeout: Duration::from_secs(1),
+            timeout: Duration::from_secs(2),
         };
 
         let handle = std::thread::spawn(move || {
@@ -511,13 +574,27 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
+        let mut malformed_stream = TcpStream::connect(addr).unwrap();
+        malformed_stream.write_all(b"GET\r\n").unwrap();
+        let mut malformed_response = String::new();
+        malformed_stream
+            .read_to_string(&mut malformed_response)
+            .unwrap();
+        assert!(
+            malformed_response.contains("400"),
+            "unexpected response: {malformed_response}"
+        );
+
         let response = test_http::send_get(addr, "/");
         assert!(response.contains("404"), "unexpected response: {response}");
 
+        let response = test_http::send_get(addr, "/auth/callback?error=access_denied");
+        assert!(response.contains("400"), "unexpected response: {response}");
+
         let result = handle.join().unwrap();
         assert!(
-            matches!(result, Err(ref err) if err.contains("OAuth timeout")),
-            "non-callback request must not terminate browser login: {result:?}"
+            matches!(result, Err(ref err) if err.contains("access_denied")),
+            "OAuth errors must still terminate browser login: {result:?}"
         );
     }
 
