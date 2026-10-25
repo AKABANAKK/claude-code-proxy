@@ -509,7 +509,13 @@ async fn invalid_json_request_is_json_error() {
     assert_eq!(error_type, "invalid_request_error");
 }
 
-async fn message_thread_response(body: Value) -> (axum::response::Response, Vec<MessagesRequest>) {
+async fn message_thread_response(
+    body: Value,
+) -> (
+    axum::response::Response,
+    Vec<MessagesRequest>,
+    MonitorHandle,
+) {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let registry = Arc::new(Registry::from_providers(
         AliasProvider::Codex,
@@ -517,7 +523,8 @@ async fn message_thread_response(body: Value) -> (axum::response::Response, Vec<
             captured: captured.clone(),
         }) as Arc<dyn Provider>],
     ));
-    let response = app(registry)
+    let monitor = MonitorHandle::new(10);
+    let response = app_with_monitor(registry, Some(monitor.clone()))
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -530,13 +537,26 @@ async fn message_thread_response(body: Value) -> (axum::response::Response, Vec<
         .await
         .unwrap();
     let requests = captured.lock().unwrap().clone();
-    (response, requests)
+    (response, requests, monitor)
 }
 
 async fn assert_message_thread_rejected(body: Value) {
-    let (response, captured) = message_thread_response(body).await;
+    let (response, captured, monitor) = message_thread_response(body).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!request_id(&response).is_empty());
     assert_eq!(captured.len(), 0);
+    let state = monitor.snapshot();
+    assert!(state.active.is_empty());
+    assert_eq!(state.recent.len(), 1);
+    assert_eq!(state.recent[0].status, RequestStatus::Failed);
+    assert_eq!(state.recent[0].http_status, Some(400));
+    assert!(
+        state.recent[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("capability_rejected: beta_header:message-threads-2026-08-12")
+    );
     let body: Value = serde_json::from_slice(
         &axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -554,7 +574,7 @@ async fn assert_message_thread_rejected(body: Value) {
 }
 
 async fn assert_message_thread_dispatched(mut body: Value) {
-    let (response, captured) = message_thread_response(body.clone()).await;
+    let (response, captured, _) = message_thread_response(body.clone()).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(captured.len(), 1);
     assert!(!captured[0].extra.contains_key("thread"));
