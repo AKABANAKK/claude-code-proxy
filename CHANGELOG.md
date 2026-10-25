@@ -3,7 +3,7 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
-## Unreleased
+## v0.1.47 (2026-10-25)
 
 - Grok requests no longer fail with HTTP 502 because of the outdated default
   client version; version rejections now include instructions for updating it.
