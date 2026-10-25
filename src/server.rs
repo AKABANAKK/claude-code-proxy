@@ -2405,6 +2405,57 @@ mod auto_review_tests {
     }
 
     #[test]
+    fn grok_session_classifier_routes_by_requested_model_or_explicit_override() {
+        use crate::config::AliasProvider;
+        use crate::registry::Registry;
+        use crate::session::{record_session_request, record_session_request_with_affinity_update};
+
+        let registry = Registry::new(AliasProvider::Codex);
+        let session_id = "grok-session-classifier-routing";
+        let initial = record_session_request(Some(session_id), None, "grok", "grok-4.6", 1)
+            .expect("Grok session");
+        assert_eq!(initial.affinity_provider, None);
+
+        for (requested, configured, expected_provider, expected_model) in [
+            ("claude-sonnet-4-6", None, "codex", "gpt-6-luna"),
+            ("grok-4.6", None, "grok", "grok-4.6"),
+            ("claude-sonnet-4-6", Some("grok-4.6"), "grok", "grok-4.6"),
+            ("gpt-6-luna", Some("grok-4.6"), "grok", "grok-4.6"),
+        ] {
+            let mut classifier = request(
+                "You are a security monitor for autonomous AI coding agents.",
+                false,
+                json!([]),
+            );
+            classifier.model = Some(requested.to_string());
+            let original = registry
+                .provider_for_model(requested, initial.affinity_provider.as_ref())
+                .expect("original provider");
+            let route =
+                apply_auto_review_model(&mut classifier, false, configured, original.name());
+            let model = classifier.model.as_deref().expect("classifier model");
+            let provider = if route.is_some() {
+                registry.provider_for_model(model, None).expect("override")
+            } else {
+                original
+            };
+            assert_eq!(provider.name(), expected_provider);
+            assert_eq!(model, expected_model);
+
+            let after_review = record_session_request_with_affinity_update(
+                Some(session_id),
+                Some(&initial),
+                provider.name(),
+                model,
+                route.is_none(),
+                2,
+            )
+            .expect("session after review");
+            assert_eq!(after_review.affinity_provider, None);
+        }
+    }
+
+    #[test]
     fn traffic_headers_redact_agent_lineage_ids() {
         let mut headers = HeaderMap::new();
         headers.insert(

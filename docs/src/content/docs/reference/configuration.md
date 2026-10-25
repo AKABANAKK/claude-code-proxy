@@ -74,7 +74,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 
 `CCP_CONFIG_DIR` affects `config.json` and file-backed provider auth. It does not relocate the state directory.
 
-Codex auto-review classifier requests use `gpt-6-luna` by default. Requests routed through other providers retain their requested model. `CCP_AUTO_REVIEW_MODEL` or `autoReviewModel` selects an explicit registered model for all detected classifier requests without changing the session's provider affinity. Normal messages, streaming requests, tool-using requests, and token counting retain their requested model.
+Auto-review routing resolves the classifier's requested model first, not the main conversation's model. Recognized Claude aliases follow Codex/Kimi session affinity or `aliasProvider`; Grok and other providers do not establish alias affinity. Codex auto-review classifier requests use `gpt-6-luna` by default. Requests routed through other providers retain their requested model. `CCP_AUTO_REVIEW_MODEL` or `autoReviewModel` selects an explicit registered model for all detected classifier requests without changing the session's provider affinity. Normal messages, streaming requests, tool-using requests, and token counting retain their requested model.
 
 ## Outbound proxies
 
