@@ -440,7 +440,10 @@ impl CodexProvider {
                 "codex_empty_completion_retry",
                 Some(serde_json::Map::from_iter([
                     ("reqId".to_string(), serde_json::json!(&req_id)),
-                    ("transport".to_string(), serde_json::json!(transport)),
+                    (
+                        "configuredTransport".to_string(),
+                        serde_json::json!(transport),
+                    ),
                     ("model".to_string(), serde_json::json!(&resolved.model)),
                     ("failedAttempt".to_string(), serde_json::json!(attempt + 1)),
                     (
@@ -837,6 +840,7 @@ async fn live_stream_response(
             request_continuation.clone(),
             request_body.clone(),
             compaction,
+            transport,
         )
         .await
         {
@@ -928,6 +932,7 @@ async fn live_stream_response_once(
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
     compaction: LiveStreamCompaction,
+    configured_transport: config::CodexTransport,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
@@ -1015,8 +1020,8 @@ async fn live_stream_response_once(
                 Some(serde_json::Map::from_iter([
                     ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
                     (
-                        "transport".to_string(),
-                        serde_json::json!(config::codex_transport().as_str()),
+                        "configuredTransport".to_string(),
+                        serde_json::json!(configured_transport.as_str()),
                     ),
                     ("model".to_string(), serde_json::json!(model)),
                     ("stream".to_string(), serde_json::json!(true)),
@@ -1358,7 +1363,7 @@ fn is_empty_completion_error(error: &client::CodexError) -> bool {
 /// the difference is visible.
 fn empty_completion_exhausted_fields(
     req_id: &str,
-    transport: &str,
+    configured_transport: &str,
     model: &str,
     attempts: u32,
     reason: &str,
@@ -1366,7 +1371,10 @@ fn empty_completion_exhausted_fields(
 ) -> serde_json::Map<String, serde_json::Value> {
     serde_json::Map::from_iter([
         ("reqId".to_string(), serde_json::json!(req_id)),
-        ("transport".to_string(), serde_json::json!(transport)),
+        (
+            "configuredTransport".to_string(),
+            serde_json::json!(configured_transport),
+        ),
         ("model".to_string(), serde_json::json!(model)),
         ("attempts".to_string(), serde_json::json!(attempts)),
         ("reason".to_string(), serde_json::json!(reason)),
@@ -2117,6 +2125,7 @@ mod tests {
                 compact_boundary: false,
                 attempt: None,
             },
+            config::CodexTransport::Http,
         )
         .await
         {
@@ -2294,14 +2303,15 @@ mod tests {
     fn empty_completion_exhausted_fields_distinguish_the_two_give_up_reasons() {
         let max = empty_completion_exhausted_fields(
             "req-1",
-            "websocket",
+            "auto",
             "gpt-6-sol",
             11,
             "max_attempts",
             157_000,
         );
         assert_eq!(max["reqId"], "req-1");
-        assert_eq!(max["transport"], "websocket");
+        assert_eq!(max["configuredTransport"], "auto");
+        assert!(max.get("transport").is_none());
         assert_eq!(max["model"], "gpt-6-sol");
         assert_eq!(max["attempts"], 11);
         assert_eq!(max["reason"], "max_attempts");
