@@ -3,6 +3,12 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- Grok requests no longer fail with HTTP 502 because of the outdated default
+  client version; version rejections now include instructions for updating it.
+  ([#180](https://github.com/raine/claude-code-proxy/issues/180))
+
 ## v0.1.46 (2026-10-23)
 
 - Cursor models can read and write files and run shell commands without stopping
