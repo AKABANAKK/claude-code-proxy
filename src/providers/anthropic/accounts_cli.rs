@@ -211,118 +211,7 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
                 }
             }
         }
-        AccountsCommand::List { sort } => {
-            let stored = store.load()?;
-            if stored.accounts.is_empty() {
-                println!("No Claude accounts registered");
-                return Ok(());
-            }
-            let usage = UsageFiles::new(paths::state_dir().join("anthropic").join("accounts"));
-            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-            let time_zone = TimeZone::system();
-            let snapshots: Vec<_> = stored
-                .accounts
-                .iter()
-                .map(|account| match usage.read(&account.name) {
-                    Ok(snapshot) => snapshot,
-                    Err(err) => {
-                        eprintln!("Cannot load usage for {}: {err:#}", account.name);
-                        None
-                    }
-                })
-                .collect();
-            let legacy_active = snapshots
-                .iter()
-                .any(|snapshot| {
-                    snapshot
-                        .as_ref()
-                        .and_then(|snapshot| snapshot["active"].as_bool())
-                        .is_none()
-                })
-                .then(|| last_selected_account(&paths::log_file(), &stored.accounts))
-                .flatten();
-            let threshold = config::anthropic_switch_threshold();
-            let mut entries: Vec<_> = stored
-                .accounts
-                .iter()
-                .zip(&snapshots)
-                .map(|(account, snapshot)| {
-                    let snapshot = snapshot.as_ref();
-                    let active = snapshot
-                        .and_then(|snapshot| snapshot["active"].as_bool())
-                        .unwrap_or_else(|| legacy_active.as_deref() == Some(account.name.as_str()));
-                    let availability = account_availability(snapshot, active, now, threshold);
-                    let status = match availability {
-                        AccountAvailability::ResetsAt(_) => "リセット待ち",
-                        _ => account_status(snapshot, active, now),
-                    };
-                    AccountListEntry {
-                        account,
-                        snapshot,
-                        status,
-                        availability,
-                    }
-                })
-                .collect();
-            if let Some(sort) = sort {
-                entries.sort_by(|left, right| sort.compare(left, right));
-            }
-            let mut rows = vec![AccountColumn::ALL.map(|column| column.name().to_owned())];
-            rows.extend(entries.into_iter().enumerate().map(|(index, entry)| {
-                let AccountListEntry {
-                    account,
-                    snapshot,
-                    status,
-                    availability,
-                } = entry;
-                [
-                    format!("{}. {}", index + 1, account.name),
-                    format!("[{status}]"),
-                    format_account_availability(availability, &time_zone),
-                    format!(
-                        "{} (reset {})",
-                        format_window_usage(snapshot, "5h", now),
-                        format_window_reset_date(snapshot, "5h", &time_zone),
-                    ),
-                    format!(
-                        "{} (reset {})",
-                        format_window_usage(snapshot, "7d", now),
-                        format_window_reset_date(snapshot, "7d", &time_zone),
-                    ),
-                    format!(
-                        "{} (reset {})",
-                        format_window_usage(snapshot, "7d_oi", now),
-                        format_window_reset_date(snapshot, "7d_oi", &time_zone),
-                    ),
-                    format_account_added_date(account.added_at),
-                ]
-            }));
-            // Terminal cell widths keep Japanese names and statuses aligned too.
-            let widths: [usize; 7] = std::array::from_fn(|column| {
-                rows.iter()
-                    .map(|row| row[column].width())
-                    .max()
-                    .unwrap_or_default()
-            });
-            for row in rows {
-                let line = row
-                    .iter()
-                    .zip(widths)
-                    .map(|(cell, width)| format!("{cell}{}", " ".repeat(width - cell.width())))
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                println!("{}", line.trim_end());
-            }
-            println!(
-                "使用率は最後に取得した値です。-- は未取得、* はリセット時刻経過後の前回値です。"
-            );
-            println!("available_at は保存情報からの利用再開時刻の目安です。");
-            println!("残量は取得できた5h・7d・7d_oiのすべてで判定します。");
-            if sort.is_some() {
-                println!("ソート項目の未取得値は末尾に表示します。");
-            }
-            Ok(())
-        }
+        AccountsCommand::List { sort } => list_accounts(store.load()?, sort, true),
         AccountsCommand::Update => {
             let stored = store.load()?;
             if stored.accounts.is_empty() {
@@ -334,8 +223,7 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
                 .enable_all()
                 .build()?;
             let updated = runtime.block_on(update_account_usage(stored.accounts));
-            println!("Updated usage for {updated} of {account_count} Claude accounts");
-            run_accounts(AccountsCommand::List { sort: None })?;
+            list_accounts(store.load()?, None, false)?;
             anyhow::ensure!(
                 updated == account_count,
                 "Failed to update usage for {} Claude accounts",
@@ -352,6 +240,122 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn list_accounts(
+    stored: accounts::StoredAnthropicAccounts,
+    sort: Option<AccountsListSort>,
+    show_notes: bool,
+) -> Result<()> {
+    if stored.accounts.is_empty() {
+        println!("No Claude accounts registered");
+        return Ok(());
+    }
+    let usage = UsageFiles::new(paths::state_dir().join("anthropic").join("accounts"));
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let time_zone = TimeZone::system();
+    let snapshots: Vec<_> = stored
+        .accounts
+        .iter()
+        .map(|account| match usage.read(&account.name) {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                eprintln!("Cannot load usage for {}: {err:#}", account.name);
+                None
+            }
+        })
+        .collect();
+    let legacy_active = snapshots
+        .iter()
+        .any(|snapshot| {
+            snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot["active"].as_bool())
+                .is_none()
+        })
+        .then(|| last_selected_account(&paths::log_file(), &stored.accounts))
+        .flatten();
+    let threshold = config::anthropic_switch_threshold();
+    let mut entries: Vec<_> = stored
+        .accounts
+        .iter()
+        .zip(&snapshots)
+        .map(|(account, snapshot)| {
+            let snapshot = snapshot.as_ref();
+            let active = snapshot
+                .and_then(|snapshot| snapshot["active"].as_bool())
+                .unwrap_or_else(|| legacy_active.as_deref() == Some(account.name.as_str()));
+            let availability = account_availability(snapshot, active, now, threshold);
+            let status = match availability {
+                AccountAvailability::ResetsAt(_) => "リセット待ち",
+                _ => account_status(snapshot, active, now),
+            };
+            AccountListEntry {
+                account,
+                snapshot,
+                status,
+                availability,
+            }
+        })
+        .collect();
+    if let Some(sort) = sort {
+        entries.sort_by(|left, right| sort.compare(left, right));
+    }
+    let mut rows = vec![AccountColumn::ALL.map(|column| column.name().to_owned())];
+    rows.extend(entries.into_iter().enumerate().map(|(index, entry)| {
+        let AccountListEntry {
+            account,
+            snapshot,
+            status,
+            availability,
+        } = entry;
+        [
+            format!("{}. {}", index + 1, account.name),
+            format!("[{status}]"),
+            format_account_availability(availability, &time_zone),
+            format!(
+                "{} (reset {})",
+                format_window_usage(snapshot, "5h", now),
+                format_window_reset_date(snapshot, "5h", &time_zone),
+            ),
+            format!(
+                "{} (reset {})",
+                format_window_usage(snapshot, "7d", now),
+                format_window_reset_date(snapshot, "7d", &time_zone),
+            ),
+            format!(
+                "{} (reset {})",
+                format_window_usage(snapshot, "7d_oi", now),
+                format_window_reset_date(snapshot, "7d_oi", &time_zone),
+            ),
+            format_account_added_date(account.added_at),
+        ]
+    }));
+    // Terminal cell widths keep Japanese names and statuses aligned too.
+    let widths: [usize; 7] = std::array::from_fn(|column| {
+        rows.iter()
+            .map(|row| row[column].width())
+            .max()
+            .unwrap_or_default()
+    });
+    for row in rows {
+        let line = row
+            .iter()
+            .zip(widths)
+            .map(|(cell, width)| format!("{cell}{}", " ".repeat(width - cell.width())))
+            .collect::<Vec<_>>()
+            .join("  ");
+        println!("{}", line.trim_end());
+    }
+    if show_notes {
+        println!("使用率は最後に取得した値です。-- は未取得、* はリセット時刻経過後の前回値です。");
+        println!("available_at は保存情報からの利用再開時刻の目安です。");
+        println!("残量は取得できた5h・7d・7d_oiのすべてで判定します。");
+        if sort.is_some() {
+            println!("ソート項目の未取得値は末尾に表示します。");
+        }
+    }
+    Ok(())
 }
 
 async fn update_account_usage(accounts: Vec<accounts::StoredAnthropicAccount>) -> usize {
