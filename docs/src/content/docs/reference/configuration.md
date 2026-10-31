@@ -68,7 +68,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 | `CCP_BIND_ADDRESS` | `bindAddress` | `127.0.0.1` | Listener IP address. |
 | `PORT` | `port` | `18765` | Listener port. |
 | `CCP_CONFIG_DIR` | none | Platform config directory | Replaces the configuration and file-backed auth root. |
-| `CCP_ALIAS_PROVIDER` | `aliasProvider` | `codex` | Routes recognized Anthropic-style aliases through `codex` or `kimi`. |
+| `CCP_ALIAS_PROVIDER` | `aliasProvider` | `anthropic` | Routes recognized Anthropic-style aliases through `anthropic`, `codex`, or `kimi`. |
 | `CCP_AUTO_REVIEW_MODEL` | `autoReviewModel` | `gpt-6-luna` for Codex | Routes Claude Code's non-streaming, tool-free Bash security-review classifier through a registered model. |
 | `CCP_LOG_STDERR` | `log.stderr` | `false` | Mirrors logs to stderr when present in the environment, regardless of its value. |
 | `CCP_LOG_VERBOSE` | `log.verbose` | `false` | Preserves full string fields in structured logs when present, regardless of its value. |
@@ -176,6 +176,11 @@ read as fractions, including values above `1.0`.
 
 The watched windows are `5h`, `7d`, and `7d_oi`, whenever their utilization
 headers are present; the requested model does not change which windows count.
+All reported windows apply together: reaching the threshold in any one of them
+blocks the account. Accounts may have no `5h` or `7d_oi` window; absent windows
+are excluded from this comparison. Explicit usage refreshes replace the window
+set when usage headers are returned, without restoring omitted limits from an
+older snapshot.
 An account at or above the threshold is blocked until the reported reset time,
 or for 15 minutes if that time is unavailable. HTTP 429 also blocks the account
 for the integer `retry-after` seconds, or 15 minutes when missing or invalid.

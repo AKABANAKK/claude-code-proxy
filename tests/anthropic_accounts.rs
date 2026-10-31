@@ -387,6 +387,112 @@ fn list_shows_selection_reset_wait_and_remaining_usage_percentages() {
 }
 
 #[test]
+fn list_checks_all_reported_windows_and_ignores_missing_five_hour_usage() {
+    let config = TempDir::new().unwrap();
+    register_list_fixture(
+        &config,
+        &[
+            "session",
+            "weekly",
+            "weekly_ready",
+            "session_without_fable",
+            "fable_with_session",
+            "fable",
+            "unknown",
+        ],
+    );
+    let reset = 4102444800_u64;
+    for (name, windows) in [
+        (
+            "session",
+            serde_json::json!({
+                "5h": {"utilization": 0.2, "resetAtUnixSecs": reset},
+                "7d": {"utilization": 1.0, "resetAtUnixSecs": reset},
+                "7d_oi": {"utilization": 0.2, "resetAtUnixSecs": reset}
+            }),
+        ),
+        (
+            "fable_with_session",
+            serde_json::json!({
+                "5h": {"utilization": 0.2, "resetAtUnixSecs": reset},
+                "7d": {"utilization": 0.2, "resetAtUnixSecs": reset},
+                "7d_oi": {"utilization": 0.99, "resetAtUnixSecs": reset}
+            }),
+        ),
+        (
+            "weekly",
+            serde_json::json!({
+                "5h": null,
+                "7d": {"utilization": 0.99, "resetAtUnixSecs": reset}
+            }),
+        ),
+        (
+            "weekly_ready",
+            serde_json::json!({
+                "7d": {"utilization": 0.2, "resetAtUnixSecs": reset}
+            }),
+        ),
+        (
+            "session_without_fable",
+            serde_json::json!({
+                "5h": {"utilization": 0.2, "resetAtUnixSecs": reset},
+                "7d": {"utilization": 0.3, "resetAtUnixSecs": reset},
+                "7d_oi": null
+            }),
+        ),
+        (
+            "fable",
+            serde_json::json!({
+                "7d": {"utilization": 0.2, "resetAtUnixSecs": reset},
+                "7d_oi": {"utilization": 0.99, "resetAtUnixSecs": reset}
+            }),
+        ),
+        (
+            "unknown",
+            serde_json::json!({"5h": null, "7d": null, "7d_oi": null}),
+        ),
+    ] {
+        write_list_usage(
+            &config,
+            name,
+            serde_json::json!({
+                "account": name, "active": false, "eligible": true, "windows": windows
+            }),
+        );
+    }
+    let output = anthropic_accounts_command(&config, &["list"])
+        .unwrap()
+        .env("TZ", "UTC")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for name in ["weekly_ready", "session_without_fable"] {
+        assert!(listed_account(&stdout, name).contains("[残あり]"));
+        assert_eq!(listed_cell(&stdout, name, "available_at"), "今すぐ");
+    }
+    for name in ["session", "weekly", "fable_with_session", "fable"] {
+        assert!(listed_account(&stdout, name).contains("[リセット待ち]"));
+        assert_eq!(
+            listed_cell(&stdout, name, "available_at"),
+            "2100/01/01 00:00"
+        );
+    }
+    assert_eq!(listed_cell(&stdout, "weekly", "5h"), "-- (reset --)");
+    assert_eq!(listed_cell(&stdout, "weekly_ready", "5h"), "-- (reset --)");
+    assert_eq!(
+        listed_cell(&stdout, "weekly_ready", "7d_oi"),
+        "-- (reset --)"
+    );
+    assert_eq!(
+        listed_cell(&stdout, "session_without_fable", "7d_oi"),
+        "-- (reset --)"
+    );
+    assert!(listed_account(&stdout, "unknown").contains("[未確認]"));
+    assert_eq!(listed_cell(&stdout, "unknown", "available_at"), "不明");
+}
+
+#[test]
 fn list_preserves_registration_order_unless_available_at_sort_is_requested() {
     let config = TempDir::new().unwrap();
     let registration_order = [
@@ -944,7 +1050,7 @@ async fn update_refreshes_all_accounts_and_preserves_selection() {
 }
 
 #[tokio::test]
-async fn update_keeps_previous_usage_on_failures_and_preserves_missing_windows() {
+async fn update_keeps_previous_usage_on_failures_and_replaces_windows_on_success() {
     let config = TempDir::new().unwrap();
     let names = [
         "current",
@@ -1020,7 +1126,7 @@ async fn update_keeps_previous_usage_on_failures_and_preserves_missing_windows()
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Updated usage for 2 of 6 Claude accounts"));
     assert_eq!(listed_account_names(&stdout), names);
-    assert!(listed_account(&stdout, "current").contains("[リセット待ち]"));
+    assert!(listed_account(&stdout, "current").contains("[稼働中]"));
     assert!(listed_account(&stdout, "invalid").contains("[認証無効]"));
     let stderr = String::from_utf8(output.stderr).unwrap();
     for name in ["invalid", "offline", "missing", "unavailable"] {
@@ -1034,17 +1140,103 @@ async fn update_keeps_previous_usage_on_failures_and_preserves_missing_windows()
     )
     .unwrap();
     assert_eq!(current["active"], true);
-    assert_eq!(current["eligible"], false);
+    assert_eq!(current["eligible"], true);
     assert_eq!(current["windows"]["5h"]["utilization"], 0.1);
-    assert_eq!(current["windows"]["7d"]["utilization"], 1.0);
-    assert_eq!(current["windows"]["7d"]["observedAtUnixSecs"], 42);
-    assert_eq!(current["windows"]["7d_oi"]["state"], "reset_elapsed");
+    assert!(current["windows"]["7d"].is_null());
+    assert!(current["windows"]["7d_oi"].is_null());
     let limited: serde_json::Value = serde_json::from_slice(
         &std::fs::read(list_usage_directory(&config).join("limited.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(limited["lastResponseStatus"], 429);
     assert_eq!(limited["eligible"], false);
+}
+
+#[tokio::test]
+async fn update_does_not_restore_absent_five_hour_or_fable_limits() {
+    let config = TempDir::new().unwrap();
+    let names = ["weekly_only", "without_fable", "without_five_hour"];
+    register_probe_fixture(&config, &names);
+    for name in names {
+        write_list_usage(
+            &config,
+            name,
+            serde_json::json!({
+                "account": name, "active": name == "weekly_only", "eligible": false,
+                "blockedUntilUnixSecs": 4102444800_u64,
+                "windows": {
+                    "5h": {"utilization": 1.0, "observedAtUnixSecs": 42, "resetAtUnixSecs": 4102444800_u64},
+                    "7d": {"utilization": 1.0, "observedAtUnixSecs": 42, "resetAtUnixSecs": 4102444800_u64},
+                    "7d_oi": {"utilization": 1.0, "observedAtUnixSecs": 42, "resetAtUnixSecs": 4102444800_u64}
+                }
+            }),
+        );
+    }
+    let output = update_against_mock(
+        &config,
+        &[
+            (
+                "weekly_only",
+                Some(concat!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n",
+                    "anthropic-ratelimit-unified-7d-utilization: 0.2\r\n",
+                    "anthropic-ratelimit-unified-7d-reset: 4102531200\r\n\r\n{}"
+                )),
+            ),
+            (
+                "without_fable",
+                Some(concat!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n",
+                    "anthropic-ratelimit-unified-5h-utilization: 0.1\r\n",
+                    "anthropic-ratelimit-unified-5h-reset: 4102444800\r\n",
+                    "anthropic-ratelimit-unified-7d-utilization: 0.2\r\n",
+                    "anthropic-ratelimit-unified-7d-reset: 4102531200\r\n\r\n{}"
+                )),
+            ),
+            (
+                "without_five_hour",
+                Some(concat!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n",
+                    "anthropic-ratelimit-unified-7d-utilization: 0.2\r\n",
+                    "anthropic-ratelimit-unified-7d-reset: 4102531200\r\n",
+                    "anthropic-ratelimit-unified-7d_oi-utilization: 0.3\r\n",
+                    "anthropic-ratelimit-unified-7d_oi-reset: 4102531200\r\n\r\n{}"
+                )),
+            ),
+        ],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Updated usage for 3 of 3 Claude accounts"));
+    for (name, five_hour, fable) in [
+        ("weekly_only", None, None),
+        ("without_fable", Some(0.1), None),
+        ("without_five_hour", None, Some(0.3)),
+    ] {
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(list_usage_directory(&config).join(format!("{name}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot["eligible"], true);
+        assert!(snapshot["blockedUntilUnixSecs"].is_null());
+        assert_eq!(snapshot["windows"]["5h"]["utilization"].as_f64(), five_hour);
+        assert_eq!(snapshot["windows"]["7d"]["utilization"], 0.2);
+        assert_eq!(snapshot["windows"]["7d_oi"]["utilization"].as_f64(), fable);
+        assert_eq!(listed_cell(&stdout, name, "available_at"), "今すぐ");
+        if five_hour.is_none() {
+            assert!(snapshot["windows"]["5h"].is_null());
+            assert_eq!(listed_cell(&stdout, name, "5h"), "-- (reset --)");
+        }
+        if fable.is_none() {
+            assert!(snapshot["windows"]["7d_oi"].is_null());
+            assert_eq!(listed_cell(&stdout, name, "7d_oi"), "-- (reset --)");
+        }
+    }
 }
 
 #[tokio::test]

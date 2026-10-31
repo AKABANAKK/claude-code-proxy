@@ -317,6 +317,7 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
                 "使用率は最後に取得した値です。-- は未取得、* はリセット時刻経過後の前回値です。"
             );
             println!("available_at は保存情報からの利用再開時刻の目安です。");
+            println!("残量は取得できた5h・7d・7d_oiのすべてで判定します。");
             if sort.is_some() {
                 println!("ソート項目の未取得値は末尾に表示します。");
             }
@@ -410,7 +411,7 @@ async fn update_account_usage(accounts: Vec<accounts::StoredAnthropicAccount>) -
             .unwrap_or_default()
             .as_secs();
         pool.observe(&selection, status, &observation, now);
-        if let Some(previous) = &previous {
+        if !has_usage && let Some(previous) = &previous {
             pool.preserve_unobserved_windows(&selection, previous, now);
         }
         let mut snapshot = pool.usage_snapshot(&selection, now);

@@ -95,8 +95,10 @@ Snapshots are not read back to restore pool state after a restart: old data is
 replaced with unknown values at startup, then filled from the new probes.
 
 `anthropic accounts update` explicitly probes all registered accounts and saves
-the refreshed snapshots before returning. It preserves the last selection and
-previous observations for windows absent from a response. Connection failures,
+the refreshed snapshots before returning. It preserves the last selection.
+When a probe returns usage headers, its reported window set replaces the old
+snapshot: omitted windows such as `5h` or `7d_oi` remain `null` and do not affect
+availability, rather than being restored from an older observation. Connection failures,
 server errors, and responses without usage headers preserve the previous usage;
 401 and 429 responses can still update invalidation or block status. Storage
 failures and partial refresh failures cause a nonzero exit. This command updates
@@ -117,7 +119,9 @@ the files used by `accounts list`; a running proxy keeps its own in-memory pool.
 Each known window contains `utilization` (a fraction, so `0.98` means 98%),
 `observedAt` / `observedAtUnixSecs`, `resetAt` / `resetAtUnixSecs`, and `state`.
 Reset times can be `null` if the upstream omitted them. Missing window headers
-in a later response preserve the previous observation and its original time.
+in normal traffic preserve the previous observation and its original time.
+Explicit usage refreshes replace the window set as described above. A response
+without any usage headers does not establish that an account has no limit.
 
 `state` is `below_threshold`, `threshold_reached`, or `reset_elapsed`, evaluated
 at the snapshot's `asOf`. `reset_elapsed` means the advertised reset time has

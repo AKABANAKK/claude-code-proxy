@@ -533,6 +533,69 @@ mod tests {
     }
 
     #[test]
+    fn every_present_window_can_limit_accounts_with_different_allowances() {
+        for mask in 1..8 {
+            let present: Vec<_> = WATCHED_WINDOWS
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, window)| (mask & (1 << index) != 0).then_some(window))
+                .collect();
+            for exhausted_window in std::iter::once(None).chain(present.iter().copied().map(Some)) {
+                let mut pool = pool_of(&["first", "second"], None);
+                let selection = pool.select(NOW_UNIX_SECS, &[]).unwrap();
+                let observation = RateLimitObservation {
+                    windows: present
+                        .iter()
+                        .map(|&window| WindowUsage {
+                            window,
+                            utilization: if Some(window) == exhausted_window {
+                                THRESHOLD
+                            } else {
+                                0.1
+                            },
+                            reset_at_unix_secs: Some(LATE_RECOVERY_UNIX_SECS),
+                        })
+                        .collect(),
+                    retry_after_secs: None,
+                };
+                let events = pool.observe(&selection, StatusCode::OK, &observation, NOW_UNIX_SECS);
+                let snapshot = pool.usage_snapshot(&selection, NOW_UNIX_SECS);
+                for window in WATCHED_WINDOWS {
+                    assert_eq!(
+                        snapshot["windows"][window].is_null(),
+                        !present.contains(&window)
+                    );
+                }
+                if let Some(window) = exhausted_window {
+                    assert_eq!(
+                        events,
+                        vec![PoolEvent::Blocked {
+                            account: "first".into(),
+                            reason: BlockReason::Utilization {
+                                window,
+                                utilization: THRESHOLD
+                            },
+                            until_unix_secs: LATE_RECOVERY_UNIX_SECS,
+                        }]
+                    );
+                    assert_eq!(snapshot["eligible"], false);
+                    assert_eq!(
+                        active_name(&mut pool, NOW_UNIX_SECS).as_deref(),
+                        Some("second")
+                    );
+                } else {
+                    assert!(events.is_empty());
+                    assert_eq!(snapshot["eligible"], true);
+                    assert_eq!(
+                        active_name(&mut pool, NOW_UNIX_SECS).as_deref(),
+                        Some("first")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fable_weekly_usage_counts_toward_threshold() {
         let mut pool = pool_of(&["first", "second"], None);
 
