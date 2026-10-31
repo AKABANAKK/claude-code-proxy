@@ -312,6 +312,7 @@ fn list_sorts_all_seven_displayed_columns_in_both_directions() {
             .unwrap();
         assert!(output.status.success(), "{sort}: {output:?}");
         let output = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(output.lines().count(), names.len() + 1, "{sort}");
         assert_eq!(listed_account_names(&output), expected, "{sort}");
         assert!(!output.contains("private-test-token"));
     }
@@ -602,7 +603,7 @@ fn list_preserves_registration_order_unless_available_at_sort_is_requested() {
     }
     let default_output = list_output(&config);
     assert_eq!(listed_account_names(&default_output), registration_order);
-    assert!(!default_output.contains("ソート項目の未取得値は末尾"));
+    assert_eq!(default_output.lines().count(), registration_order.len() + 1);
     let output = anthropic_accounts_command(&config, &["list", "available_at:asc"])
         .unwrap()
         .env("TZ", "UTC")
@@ -643,7 +644,7 @@ fn list_preserves_registration_order_unless_available_at_sort_is_requested() {
         assert_eq!(listed_cell(&stdout, name, "available_at"), "不明");
     }
     assert_eq!(listed_cell(&stdout, "invalid", "available_at"), "要再認証");
-    assert!(stdout.contains("ソート項目の未取得値は末尾"));
+    assert_eq!(stdout.lines().count(), registration_order.len() + 1);
     assert_eq!(std::fs::read(registry).unwrap(), registrations);
     assert_eq!(
         listed_account_names(&list_output(&config)),
@@ -729,7 +730,7 @@ fn list_expires_blocks_preserves_old_usage_and_identifies_invalid_credentials() 
     assert!(listed_cell(&stdout, "recovered", "7d").starts_with("40.0% (reset "));
     assert!(listed_account(&stdout, "invalid").contains("[認証無効]"));
     assert!(listed_account(&stdout, "old").contains("[未確認]"));
-    assert!(stdout.contains("* はリセット時刻経過後の前回値"));
+    assert_eq!(stdout.lines().count(), 4);
 }
 
 #[test]
