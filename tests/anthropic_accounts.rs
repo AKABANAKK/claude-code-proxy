@@ -1027,7 +1027,25 @@ async fn update_refreshes_all_accounts_and_preserves_selection() {
     let output = update_against_mock(&config, &responses).await;
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Updated usage for 6 of 6 Claude accounts"));
+    assert_eq!(stdout.lines().count(), names.len() + 1);
+    assert_eq!(
+        stdout
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        [
+            "name",
+            "status",
+            "available_at",
+            "5h",
+            "7d",
+            "7d_oi",
+            "added_at"
+        ]
+    );
+    assert_eq!(listed_account_names(&stdout), names);
     assert!(listed_account(&stdout, "second").contains("[稼働中]"));
     assert_eq!(
         listed_cell(&stdout, "second", "5h"),
@@ -1124,7 +1142,7 @@ async fn update_keeps_previous_usage_on_failures_and_replaces_windows_on_success
     .await;
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Updated usage for 2 of 6 Claude accounts"));
+    assert_eq!(stdout.lines().count(), names.len() + 1);
     assert_eq!(listed_account_names(&stdout), names);
     assert!(listed_account(&stdout, "current").contains("[稼働中]"));
     assert!(listed_account(&stdout, "invalid").contains("[認証無効]"));
@@ -1212,7 +1230,8 @@ async fn update_does_not_restore_absent_five_hour_or_fable_limits() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Updated usage for 3 of 3 Claude accounts"));
+    assert_eq!(stdout.lines().count(), names.len() + 1);
+    assert_eq!(listed_account_names(&stdout), names);
     for (name, five_hour, fable) in [
         ("weekly_only", None, None),
         ("without_fable", Some(0.1), None),
@@ -1247,11 +1266,9 @@ async fn update_reports_usage_write_failures() {
     std::fs::create_dir_all(&snapshot_path).unwrap();
     let output = update_against_mock(&config, &[("first", Some(MOCK_UPDATED_USAGE))]).await;
     assert_eq!(output.status.code(), Some(1));
-    assert!(
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .contains("Updated usage for 0 of 1 Claude accounts")
-    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 2);
+    assert_eq!(listed_account_names(&stdout), ["first"]);
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
