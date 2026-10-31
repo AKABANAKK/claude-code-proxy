@@ -211,7 +211,7 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
                 }
             }
         }
-        AccountsCommand::List { sort } => list_accounts(store.load()?, sort, true),
+        AccountsCommand::List { sort } => list_accounts(store.load()?, sort),
         AccountsCommand::Update => {
             let stored = store.load()?;
             if stored.accounts.is_empty() {
@@ -223,7 +223,7 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
                 .enable_all()
                 .build()?;
             let updated = runtime.block_on(update_account_usage(stored.accounts));
-            list_accounts(store.load()?, None, false)?;
+            list_accounts(store.load()?, None)?;
             anyhow::ensure!(
                 updated == account_count,
                 "Failed to update usage for {} Claude accounts",
@@ -245,7 +245,6 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
 fn list_accounts(
     stored: accounts::StoredAnthropicAccounts,
     sort: Option<AccountsListSort>,
-    show_notes: bool,
 ) -> Result<()> {
     if stored.accounts.is_empty() {
         println!("No Claude accounts registered");
@@ -346,14 +345,6 @@ fn list_accounts(
             .collect::<Vec<_>>()
             .join("  ");
         println!("{}", line.trim_end());
-    }
-    if show_notes {
-        println!("使用率は最後に取得した値です。-- は未取得、* はリセット時刻経過後の前回値です。");
-        println!("available_at は保存情報からの利用再開時刻の目安です。");
-        println!("残量は取得できた5h・7d・7d_oiのすべてで判定します。");
-        if sort.is_some() {
-            println!("ソート項目の未取得値は末尾に表示します。");
-        }
     }
     Ok(())
 }
