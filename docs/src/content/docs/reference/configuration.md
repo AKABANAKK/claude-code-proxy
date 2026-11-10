@@ -23,11 +23,12 @@ These settings configure the proxy process. Claude Code client settings such as 
     "reasoningSummary": "auto",
     "serviceTier": "fast",
     "baseUrl": "https://chatgpt.com/backend-api/codex/responses",
-    "transport": "websocket",
+    "transport": "auto",
     "headerTimeoutMs": 300000,
     "previousResponseId": false,
     "serverCompaction": false,
     "responsesApi": false,
+    "fullLane": false,
     "imagesApi": false,
     "imagesBaseUrl": "https://chatgpt.com/backend-api/codex"
   },
@@ -111,11 +112,12 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | `CCP_CODEX_REASONING_SUMMARY` | `codex.reasoningSummary` | unset | Overrides summary mode. `off` and `none` suppress summaries. |
 | `CCP_CODEX_SERVICE_TIER` | `codex.serviceTier` | unset | Forces `fast`, `priority`, `ultrafast`, or `flex` on `/v1/messages` requests. Fast is sent as `priority`. Ultrafast is sent as `priority` to models that do not offer it. |
 | `CCP_CODEX_BASE_URL` | `codex.baseUrl` | ChatGPT Codex Responses URL | Changes the Codex endpoint. |
-| `CCP_CODEX_TRANSPORT` | `codex.transport` | `websocket` | Selects `websocket`, `http`, or `auto`. |
+| `CCP_CODEX_TRANSPORT` | `codex.transport` | `auto` | Selects `websocket`, `http`, or `auto`. `auto` falls back to HTTP SSE only when WebSocket setup fails before a request is sent. |
 | `CCP_CODEX_HEADER_TIMEOUT_MS` | `codex.headerTimeoutMs` | `300000` | Sets how long an HTTP-transport request waits for the Codex response headers. Values below `1000` are ignored. |
 | `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `false` | Enables append-only WebSocket continuation for `1`, `true`, or `yes`. |
 | `CCP_CODEX_SERVER_COMPACTION` | `codex.serverCompaction` | `false` | Enables or disables native compaction for standard boolean words. |
 | `CCP_CODEX_RESPONSES_API` | `codex.responsesApi` | `false` | Enables `/v1/responses` and `/v1/chat/completions` for every registered provider. Accepts `1`, `true`, or `yes`. |
+| `CCP_CODEX_FULL_LANE` | `codex.fullLane` | `false` | Enables parallel tool calls on the six [supported full-lane models](/providers/codex/#responses-lanes-and-parallel-tools). Luna and catalog-only models keep their default lane. Accepts `1`, `true`, or `yes`. |
 | `CCP_CODEX_IMAGES_API` | `codex.imagesApi` | `false` | Enables `/v1/images/generations` and `/v1/images/edits` for `1`, `true`, or `yes`. |
 | `CCP_CODEX_IMAGES_BASE_URL` | `codex.imagesBaseUrl` | `https://chatgpt.com/backend-api/codex` | Sets the trusted Codex Images API root; production use is restricted to HTTPS `chatgpt.com/backend-api/codex`. |
 | `CCP_CODEX_ORIGINATOR` | `codex.originator` | `claude-code-proxy` | Changes the Codex `originator` header. |

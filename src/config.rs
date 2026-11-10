@@ -65,10 +65,14 @@ struct CodexConfig {
     pub user_agent: Option<String>,
     #[serde(rename = "previousResponseId")]
     pub previous_response_id: Option<bool>,
+    #[serde(rename = "requestCompression")]
+    pub request_compression: Option<bool>,
     #[serde(rename = "serverCompaction")]
     pub server_compaction: Option<bool>,
     #[serde(rename = "responsesApi")]
     pub responses_api: Option<bool>,
+    #[serde(rename = "fullLane")]
+    pub full_lane: Option<bool>,
     #[serde(rename = "imagesApi")]
     pub images_api: Option<bool>,
     #[serde(rename = "imagesBaseUrl")]
@@ -271,6 +275,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_RESPONSES_API") {
         out.push("codex.responsesApi (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_FULL_LANE") {
+        out.push("codex.fullLane (env)".to_string());
+    }
     if env.contains_key("CCP_CODEX_IMAGES_API") {
         out.push("codex.imagesApi (env)".to_string());
     }
@@ -324,6 +331,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_SERVER_COMPACTION") {
         out.push("CCP_CODEX_SERVER_COMPACTION (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_REQUEST_COMPRESSION") {
+        out.push("CCP_CODEX_REQUEST_COMPRESSION (env)".to_string());
+    }
     if env
         .get("CCP_AUTO_REVIEW_MODEL")
         .is_some_and(|raw| !raw.is_empty())
@@ -372,8 +382,14 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             if let Some(enabled) = codex.server_compaction {
                 out.push(format!("codex.serverCompaction: {enabled}"));
             }
+            if let Some(enabled) = codex.request_compression {
+                out.push(format!("codex.requestCompression: {enabled}"));
+            }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
+            }
+            if codex.full_lane == Some(true) {
+                out.push("codex.fullLane: true".to_string());
             }
             if codex.images_api == Some(true) {
                 out.push("codex.imagesApi: true".to_string());
@@ -721,6 +737,25 @@ pub fn codex_previous_response_id() -> bool {
     false
 }
 
+pub fn codex_request_compression() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_REQUEST_COMPRESSION") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.request_compression
+    {
+        return enabled;
+    }
+    false
+}
+
 pub fn codex_server_compaction() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_SERVER_COMPACTION") {
@@ -749,6 +784,21 @@ pub fn codex_responses_api() -> bool {
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.responses_api
+    {
+        return enabled;
+    }
+    false
+}
+
+pub fn codex_full_lane() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_FULL_LANE") {
+        return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.full_lane
     {
         return enabled;
     }
@@ -917,7 +967,10 @@ pub fn codex_transport() -> CodexTransport {
     {
         return transport;
     }
-    CodexTransport::WebSocket
+    if codex_request_compression() {
+        return CodexTransport::Http;
+    }
+    CodexTransport::Auto
 }
 
 /// How long an HTTP-transport request waits for the Codex response headers.
@@ -1045,8 +1098,10 @@ mod tests {
             EnvGuard::unset("CCP_LOG_VERBOSE"),
             EnvGuard::unset("CCP_LOG_STDERR"),
             EnvGuard::unset("CCP_CODEX_REASONING_SUMMARY"),
+            EnvGuard::unset("CCP_CODEX_REQUEST_COMPRESSION"),
             EnvGuard::unset("CCP_CODEX_SERVER_COMPACTION"),
             EnvGuard::unset("CCP_CODEX_RESPONSES_API"),
+            EnvGuard::unset("CCP_CODEX_FULL_LANE"),
             EnvGuard::unset("CCP_CODEX_IMAGES_API"),
             EnvGuard::unset("CCP_CODEX_IMAGES_BASE_URL"),
             EnvGuard::unset("CCP_CODEX_TRANSCRIPTIONS_API"),
@@ -1184,12 +1239,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_transport_defaults_to_websocket() {
+    fn codex_transport_defaults_to_auto() {
         let _guard = ENV_LOCK.lock().unwrap();
         let config = tempfile::TempDir::new().unwrap();
         let _env = isolated_env(&config);
-        let result = codex_transport();
-        assert_eq!(result, CodexTransport::WebSocket);
+        assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 
     #[test]
@@ -1197,9 +1251,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let config = tempfile::TempDir::new().unwrap();
         let _env = isolated_env(&config);
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "auto");
-        }
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
         assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 
@@ -1208,32 +1260,72 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let config = tempfile::TempDir::new().unwrap();
         let _env = isolated_env(&config);
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "websocket");
-        }
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
         assert_eq!(codex_transport(), CodexTransport::WebSocket);
     }
 
     #[test]
-    fn codex_transport_invalid_env_falls_back_to_websocket() {
+    fn codex_transport_invalid_env_falls_back_to_auto() {
         let _guard = ENV_LOCK.lock().unwrap();
         let config = tempfile::TempDir::new().unwrap();
         let _env = isolated_env(&config);
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "invalid");
-        }
-        assert_eq!(codex_transport(), CodexTransport::WebSocket);
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "invalid");
+        assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 
     #[test]
-    fn codex_transport_empty_env_falls_back_to_websocket() {
+    fn codex_transport_empty_env_falls_back_to_auto() {
         let _guard = ENV_LOCK.lock().unwrap();
         let config = tempfile::TempDir::new().unwrap();
         let _env = isolated_env(&config);
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "");
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "");
+        assert_eq!(codex_transport(), CodexTransport::Auto);
+    }
+
+    #[test]
+    fn codex_transport_file_and_env_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        for (file_value, expected) in [
+            ("http", CodexTransport::Http),
+            ("websocket", CodexTransport::WebSocket),
+            ("auto", CodexTransport::Auto),
+        ] {
+            std::fs::write(
+                config.path().join("config.json"),
+                serde_json::json!({"codex": {"transport": file_value}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(codex_transport(), expected);
+            for env_value in ["", "invalid"] {
+                let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", env_value);
+                assert_eq!(codex_transport(), expected);
+            }
+            for (env_value, expected) in [
+                ("http", CodexTransport::Http),
+                ("websocket", CodexTransport::WebSocket),
+                ("auto", CodexTransport::Auto),
+            ] {
+                let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", env_value);
+                assert_eq!(codex_transport(), expected);
+            }
         }
-        assert_eq!(codex_transport(), CodexTransport::WebSocket);
+    }
+
+    #[test]
+    fn codex_transport_invalid_or_empty_file_falls_back_to_auto() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        for value in ["", "invalid"] {
+            std::fs::write(
+                config.path().join("config.json"),
+                serde_json::json!({"codex": {"transport": value}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(codex_transport(), CodexTransport::Auto);
+        }
     }
 
     #[test]
@@ -1335,6 +1427,38 @@ mod tests {
         assert!(codex_responses_api());
         let _responses_env = EnvGuard::set("CCP_CODEX_RESPONSES_API", "false");
         assert!(!codex_responses_api());
+    }
+
+    #[test]
+    fn codex_full_lane_defaults_off_reads_config_and_env_takes_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        assert!(!codex_full_lane());
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"fullLane":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_full_lane());
+        let _full_lane_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "false");
+        assert!(!codex_full_lane());
+    }
+
+    #[test]
+    fn codex_full_lane_accepts_boolean_env_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        for value in ["1", "true", "TRUE", "yes"] {
+            let _flag = EnvGuard::set("CCP_CODEX_FULL_LANE", value);
+            assert!(codex_full_lane(), "{value}");
+        }
+        for value in ["0", "false", "no", "invalid", ""] {
+            let _flag = EnvGuard::set("CCP_CODEX_FULL_LANE", value);
+            assert!(!codex_full_lane(), "{value}");
+        }
     }
 
     #[test]
@@ -1468,5 +1592,32 @@ mod tests {
         assert!(codex_server_compaction());
         let _disabled_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "false");
         assert!(!codex_server_compaction());
+    }
+
+    #[test]
+    fn codex_request_compression_defaults_and_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+
+        assert!(!codex_request_compression());
+        {
+            let _enabled_env = EnvGuard::set("CCP_CODEX_REQUEST_COMPRESSION", "on");
+            assert!(codex_request_compression());
+        }
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"requestCompression":true}}"#,
+        )
+        .unwrap();
+        assert!(codex_request_compression());
+        assert_eq!(codex_transport(), CodexTransport::Http);
+        {
+            let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
+            assert_eq!(codex_transport(), CodexTransport::Auto);
+        }
+        let _disabled_env = EnvGuard::set("CCP_CODEX_REQUEST_COMPRESSION", "false");
+        assert!(!codex_request_compression());
+        assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 }

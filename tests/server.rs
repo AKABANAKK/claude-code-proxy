@@ -1,3 +1,6 @@
+#[path = "support/isolated_codex.rs"]
+mod isolated_codex;
+
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -1232,6 +1235,9 @@ async fn anthropic_bodies_over_limit_return_request_too_large() {
 
 #[tokio::test]
 async fn known_model_reaches_codex_provider() {
+    if isolated_codex::rerun_without_credentials("known_model_reaches_codex_provider") {
+        return;
+    }
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app
         .oneshot(
@@ -1247,11 +1253,14 @@ async fn known_model_reaches_codex_provider() {
         .await
         .unwrap();
 
-    // Codex provider is now concrete, so it should attempt auth before returning 501
-    let status = response.status();
+    // A known model reaches the concrete provider's authentication boundary.
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = error_body(response).await;
     assert!(
-        status != StatusCode::NOT_IMPLEMENTED,
-        "codex should no longer be a placeholder provider"
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Not authenticated")
     );
 }
 
@@ -2047,6 +2056,8 @@ async fn models_endpoint_lists_supported_models() {
     assert!(ids.contains(&"gpt-5.6-sol"));
     assert!(ids.contains(&"gpt-6.1-sol"));
     assert!(ids.contains(&"gpt-6.1-sol-fast"));
+    assert!(ids.contains(&"gpt-6.1-terra"));
+    assert!(ids.contains(&"gpt-6.1-terra-fast"));
     assert!(ids.contains(&"gpt-6-astra-ultrafast"));
     assert!(ids.contains(&"gpt-6.1-sol-ultrafast"));
     assert!(!ids.contains(&"gpt-6-sol-ultrafast"));
