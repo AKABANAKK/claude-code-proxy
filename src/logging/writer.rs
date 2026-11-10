@@ -88,7 +88,7 @@ impl BackgroundWriter {
                     for index in 0..BATCH_RECORDS {
                         match command {
                             Command::Record(record) => {
-                                let _ = file.write(&record.path, &record.line);
+                                let _ = file.write(&record.path, record.line);
                             }
                             Command::Flush(done) => {
                                 let _ = file.flush();
@@ -216,7 +216,7 @@ impl LogFile {
         Ok(())
     }
 
-    fn write(&mut self, path: &Path, line: &str) -> io::Result<()> {
+    fn write(&mut self, path: &Path, mut line: String) -> io::Result<()> {
         let mut reopen = self.current.as_ref().is_none_or(|file| file.path != path);
         if !reopen && !self.checked {
             match fs::metadata(path) {
@@ -244,9 +244,11 @@ impl LogFile {
             self.open(path)?;
         }
         let file = self.current.as_mut().expect("open log");
+        // Keep the newline in the same write as its record, including records
+        // larger than the buffer. Other CLI/server processes may append here.
+        line.push('\n');
         file.output.write_all(line.as_bytes())?;
-        file.output.write_all(b"\n")?;
-        file.bytes = file.bytes.saturating_add(line.len() as u64 + 1);
+        file.bytes = file.bytes.saturating_add(line.len() as u64);
         Ok(())
     }
 
@@ -313,7 +315,7 @@ mod tests {
         fs::write(&path, "existing\n").unwrap();
         let mut writer = LogFile::new(128);
         for index in 0..200 {
-            writer.write(&path, &format!("record-{index}")).unwrap();
+            writer.write(&path, format!("record-{index}")).unwrap();
         }
         writer.close().unwrap();
         let mut actual = HashSet::new();
@@ -350,14 +352,34 @@ mod tests {
         let path = directory.path().join("proxy.log");
         let old = directory.path().join("old.log");
         let mut writer = LogFile::new(1_024);
-        writer.write(&path, "before").unwrap();
+        writer.write(&path, "before".into()).unwrap();
         writer.flush().unwrap();
         fs::rename(&path, &old).unwrap();
         fs::write(&path, "other\n").unwrap();
         writer.begin_batch();
-        writer.write(&path, "after").unwrap();
+        writer.write(&path, "after".into()).unwrap();
         writer.flush().unwrap();
         assert_eq!(fs::read_to_string(old).unwrap(), "before\n");
         assert_eq!(fs::read_to_string(path).unwrap(), "other\nafter\n");
+    }
+
+    #[test]
+    fn independent_writers_keep_large_records_and_newlines_together() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("proxy.log");
+        let large = serde_json::json!({"text": "x".repeat(70_000)});
+        let small = serde_json::json!({"text": "second"});
+        let mut first = LogFile::new(1_000_000);
+        let mut second = LogFile::new(1_000_000);
+        first.write(&path, large.to_string()).unwrap();
+        second.write(&path, small.to_string()).unwrap();
+        second.flush().unwrap();
+        first.flush().unwrap();
+        let records: Vec<serde_json::Value> = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records, [large, small]);
     }
 }
