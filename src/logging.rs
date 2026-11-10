@@ -1,15 +1,18 @@
-use crate::{config, paths};
+mod writer;
+
+use crate::config;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
 
 static STDERR_SUPPRESSION_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static ROTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub const REDACT_KEYS: [&str; 15] = [
     "authorization",
@@ -30,7 +33,26 @@ pub const REDACT_KEYS: [&str; 15] = [
 ];
 
 pub fn log_file() -> std::path::PathBuf {
-    paths::log_file()
+    config::logging_path()
+}
+
+/// Wait for records queued before this call to reach the log file.
+pub fn flush() {
+    writer::flush();
+}
+
+/// Keep this guard alive until the CLI/server has finished shutting down.
+pub struct FlushGuard;
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        flush();
+    }
+}
+
+pub fn exit(code: i32) -> ! {
+    flush();
+    std::process::exit(code)
 }
 
 #[must_use]
@@ -128,16 +150,19 @@ pub fn create_logger(service: &str) -> Logger {
 }
 
 fn write_log_line(line: String) -> io::Result<()> {
-    let file = log_file();
+    writer::write(log_file(), line)
+}
+
+fn write_log_line_sync(file: &Path, line: String) -> io::Result<()> {
     if let Some(dir) = file.parent() {
         create_dir(dir, 0o700)?;
     }
 
-    if fs::metadata(&file).is_ok_and(|meta| meta.len() > MAX_LOG_BYTES) {
-        rotate_file(&file)?;
+    if fs::metadata(file).is_ok_and(|meta| meta.len() > MAX_LOG_BYTES) {
+        rotate_file(file)?;
     }
 
-    append_log_line(&file, line)
+    append_log_line(file, line)
 }
 
 fn append_log_line(path: &Path, mut line: String) -> io::Result<()> {
@@ -152,7 +177,8 @@ fn rotate_file(path: &Path) -> io::Result<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let rotated = path.with_extension(format!("{ts}"));
+    let sequence = ROTATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let rotated = path.with_extension(format!("{ts}-{sequence}"));
     fs::rename(path, rotated)?;
     Ok(())
 }

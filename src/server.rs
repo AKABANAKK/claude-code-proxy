@@ -304,7 +304,18 @@ pub fn app_with_features(
     } else {
         router
     };
-    router.fallback(fallback_handler).with_state(state)
+    router
+        .fallback(fallback_handler)
+        .layer(axum::middleware::from_fn(request_config_snapshot))
+        .with_state(state)
+}
+
+async fn request_config_snapshot(request: Request<Body>, next: axum::middleware::Next) -> Response {
+    if request.uri().path().starts_with("/v1/") {
+        crate::config::with_request_snapshot(next.run(request)).await
+    } else {
+        next.run(request).await
+    }
 }
 
 #[derive(Clone)]

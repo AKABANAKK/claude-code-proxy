@@ -207,7 +207,7 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
                 }
                 Err(err) => {
                     eprintln!("{err}");
-                    std::process::exit(2);
+                    crate::logging::exit(2);
                 }
             }
         }
@@ -234,7 +234,7 @@ fn run_accounts(command: AccountsCommand) -> Result<()> {
         AccountsCommand::Remove { name } => {
             if let Err(err) = store.remove(&name) {
                 eprintln!("{err}");
-                std::process::exit(2);
+                crate::logging::exit(2);
             }
             println!("Removed account {name}");
             Ok(())
@@ -594,6 +594,7 @@ fn last_selected_account(
     path: &Path,
     accounts: &[accounts::StoredAnthropicAccount],
 ) -> Option<String> {
+    crate::logging::flush();
     let file = File::open(path).ok()?;
     let mut active = None;
     for line in BufReader::new(file)
