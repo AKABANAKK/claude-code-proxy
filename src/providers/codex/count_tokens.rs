@@ -119,7 +119,7 @@ fn count_tool_tokens(tools: &[ResponsesTool]) -> u64 {
 }
 
 pub(crate) fn approx_token_count(text: &str) -> u64 {
-    u64::try_from(o200k_base_singleton().count_ordinary(text)).unwrap_or(u64::MAX)
+    super::token_cache::token_count(text)
 }
 
 pub(crate) fn truncate_to_token_budget(text: &str, max_tokens: u64) -> String {

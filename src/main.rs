@@ -88,6 +88,7 @@ enum ProviderGroup {
 }
 
 fn main() -> Result<()> {
+    let _logging_guard = logging::FlushGuard;
     let cli = Cli::parse();
 
     if cli.version_flag {
@@ -156,7 +157,7 @@ fn main() -> Result<()> {
                     if matches!(&ui_result, Ok(MonitorExit::ForceQuit)) {
                         server_task.abort();
                         let _ = runtime.block_on(server_task);
-                        std::process::exit(130);
+                        logging::exit(130);
                     }
                     let server_result = runtime.block_on(server_task)?;
                     ui_result?;
@@ -216,7 +217,7 @@ async fn run_service(config: ServerConfig) -> Result<()> {
                 result = &mut server => result,
                 signal = signals.recv() => {
                     signal?;
-                    std::process::exit(130);
+                    logging::exit(130);
                 }
             }
         }
@@ -304,21 +305,21 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
             claude_code_proxy::provider::AuthCommand::Login => {
                 if let Err(err) = handlers.login() {
                     eprintln!("{err}");
-                    std::process::exit(2);
+                    logging::exit(2);
                 }
                 Ok(())
             }
             claude_code_proxy::provider::AuthCommand::Device => {
                 if let Err(err) = handlers.device() {
                     eprintln!("{err}");
-                    std::process::exit(2);
+                    logging::exit(2);
                 }
                 Ok(())
             }
             claude_code_proxy::provider::AuthCommand::Status => {
                 if let Err(err) = handlers.status() {
                     println!("{err}");
-                    std::process::exit(1);
+                    logging::exit(1);
                 }
                 Ok(())
             }

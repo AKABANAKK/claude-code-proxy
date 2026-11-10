@@ -5,8 +5,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use super::read_file_config;
-use crate::paths;
+use super::{config_dir, environment, read_file_config};
 
 #[derive(Deserialize, Clone)]
 pub(super) struct AnthropicConfig {
@@ -22,7 +21,7 @@ fn normalize_switch_threshold(value: f64) -> Option<f64> {
 }
 
 pub fn anthropic_switch_threshold() -> f64 {
-    switch_threshold_for_env(&std::env::vars().collect(), &paths::config_dir())
+    switch_threshold_for_env(&environment(), &config_dir())
 }
 
 fn switch_threshold_for_env(env: &HashMap<String, String>, config_dir: &Path) -> f64 {
@@ -39,8 +38,9 @@ fn switch_threshold_for_env(env: &HashMap<String, String>, config_dir: &Path) ->
 }
 
 pub fn anthropic_active_account() -> Option<String> {
-    std::env::var("CCP_ANTHROPIC_ACTIVE_ACCOUNT")
-        .ok()
+    environment()
+        .get("CCP_ANTHROPIC_ACTIVE_ACCOUNT")
+        .cloned()
         .filter(|raw| !raw.is_empty())
 }
 

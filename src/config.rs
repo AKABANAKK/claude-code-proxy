@@ -1,11 +1,14 @@
 mod anthropic;
+mod cache;
 pub use anthropic::{
     DEFAULT_ANTHROPIC_SWITCH_THRESHOLD, anthropic_active_account, anthropic_switch_threshold,
 };
 
+pub use cache::with_request_snapshot;
+use cache::{config_dir, environment};
+
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::paths;
@@ -37,7 +40,7 @@ pub struct LoadedConfig {
     pub config_dir: PathBuf,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct FileConfig {
     #[serde(rename = "bindAddress")]
     pub bind_address: Option<String>,
@@ -128,7 +131,7 @@ struct OpenCodeConfig {
     pub base_url: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct FileLog {
     pub verbose: Option<bool>,
     pub stderr: Option<bool>,
@@ -144,12 +147,13 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
 }
 
 fn read_file_config(config_dir: &Path) -> Option<FileConfig> {
-    let path = config_dir.join("config.json");
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+    cache::read(config_dir)
 }
 
 pub fn load_config() -> LoadedConfig {
+    if let Some(snapshot) = cache::current() {
+        return load_config_from_env(&snapshot.env, snapshot.directory.clone());
+    }
     let env = paths::DirResolverEnv::default();
     let config_dir = paths::resolve_config_dir(&env);
     load_config_from_env(&env.env, config_dir)
@@ -229,8 +233,12 @@ fn load_config_from_env(env: &HashMap<String, String>, config_dir: PathBuf) -> L
     out
 }
 
+pub(crate) fn logging_path() -> PathBuf {
+    cache::log_file()
+}
+
 pub fn config_path() -> PathBuf {
-    paths::config_dir().join("config.json")
+    config_dir().join("config.json")
 }
 
 pub fn port() -> u16 {
@@ -255,7 +263,7 @@ pub fn log_stderr() -> bool {
 
 pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     let file = read_file_config(&cfg.config_dir);
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     let mut out = Vec::new();
     if env.contains_key("CCP_BIND_ADDRESS") {
         out.push("bindAddress (env)".to_string());
@@ -409,11 +417,11 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
 }
 
 pub fn grok_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_GROK_BASE_URL") {
         return raw.clone();
     }
-    if let Some(grok) = read_file_config(&paths::config_dir()).and_then(|f| f.grok)
+    if let Some(grok) = read_file_config(&config_dir()).and_then(|f| f.grok)
         && let Some(url) = grok.base_url
     {
         return url;
@@ -422,11 +430,11 @@ pub fn grok_base_url() -> String {
 }
 
 pub fn grok_client_version() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_GROK_CLIENT_VERSION") {
         return raw.clone();
     }
-    if let Some(grok) = read_file_config(&paths::config_dir()).and_then(|f| f.grok)
+    if let Some(grok) = read_file_config(&config_dir()).and_then(|f| f.grok)
         && let Some(version) = grok.client_version
     {
         return version;
@@ -464,14 +472,15 @@ pub fn parse_grok_tool_image_mode(raw: Option<&str>) -> GrokToolImageMode {
 }
 
 pub fn grok_tool_image_mode() -> GrokToolImageMode {
-    parse_grok_tool_image_mode(std::env::var("CCP_GROK_TOOL_IMAGE").ok().as_deref())
+    parse_grok_tool_image_mode(environment().get("CCP_GROK_TOOL_IMAGE").cloned().as_deref())
 }
 
 /// Warn once at startup when an unknown mode was requested. Called from the
 /// Grok provider constructor rather than per request.
 pub fn warn_grok_tool_image_mode_once(log: &crate::logging::Logger) {
-    match std::env::var("CCP_GROK_TOOL_IMAGE")
-        .ok()
+    match environment()
+        .get("CCP_GROK_TOOL_IMAGE")
+        .cloned()
         .as_deref()
         .map(str::trim)
     {
@@ -511,7 +520,12 @@ pub fn parse_grok_hosted_search(raw: Option<&str>) -> bool {
 }
 
 pub fn grok_hosted_search() -> bool {
-    parse_grok_hosted_search(std::env::var("CCP_GROK_HOSTED_SEARCH").ok().as_deref())
+    parse_grok_hosted_search(
+        environment()
+            .get("CCP_GROK_HOSTED_SEARCH")
+            .cloned()
+            .as_deref(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -540,7 +554,12 @@ pub fn parse_grok_search_blocks(raw: Option<&str>) -> GrokSearchBlocks {
 }
 
 pub fn grok_search_blocks() -> GrokSearchBlocks {
-    parse_grok_search_blocks(std::env::var("CCP_GROK_SEARCH_BLOCKS").ok().as_deref())
+    parse_grok_search_blocks(
+        environment()
+            .get("CCP_GROK_SEARCH_BLOCKS")
+            .cloned()
+            .as_deref(),
+    )
 }
 
 struct ResolvedOpenCodeConfig {
@@ -593,18 +612,18 @@ fn resolve_opencode_config(
 }
 
 pub fn opencode_api_key() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    resolve_opencode_config(&env, &paths::config_dir()).api_key
+    let env = environment();
+    resolve_opencode_config(&env, &config_dir()).api_key
 }
 
 pub fn opencode_api_key_source() -> Option<&'static str> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    resolve_opencode_config(&env, &paths::config_dir()).api_key_source
+    let env = environment();
+    resolve_opencode_config(&env, &config_dir()).api_key_source
 }
 
 pub fn opencode_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    resolve_opencode_config(&env, &paths::config_dir()).base_url
+    let env = environment();
+    resolve_opencode_config(&env, &config_dir()).base_url
 }
 
 pub fn is_verbose() -> bool {
@@ -612,7 +631,7 @@ pub fn is_verbose() -> bool {
 }
 
 pub fn anthropic_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_ANTHROPIC_BASE_URL") {
         return raw.clone();
     }
@@ -620,11 +639,11 @@ pub fn anthropic_base_url() -> String {
 }
 
 pub fn kimi_oauth_host() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_KIMI_OAUTH_HOST") {
         return raw.clone();
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(kimi) = file.kimi
         && let Some(host) = kimi.oauth_host
@@ -635,11 +654,11 @@ pub fn kimi_oauth_host() -> String {
 }
 
 pub fn kimi_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_KIMI_BASE_URL") {
         return raw.clone();
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(kimi) = file.kimi
         && let Some(url) = kimi.base_url
@@ -650,14 +669,14 @@ pub fn kimi_base_url() -> String {
 }
 
 pub fn kimi_user_agent(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_KIMI_USER_AGENT") {
         return raw.clone();
     }
     if let Some(raw) = env.get("CCP_USER_AGENT") {
         return raw.clone();
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(kimi) = file.kimi
         && let Some(ua) = kimi.user_agent
@@ -672,14 +691,14 @@ pub fn kimi_user_agent(default: &str) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn codex_base_url(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_BASE_URL") {
         return raw.clone();
     }
     if let Some(raw) = env.get("CLAUDE_CODE_PROXY_CODEX_BASE_URL") {
         return raw.clone();
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(url) = codex.base_url
@@ -690,11 +709,11 @@ pub fn codex_base_url(default: &str) -> String {
 }
 
 pub fn codex_originator(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_ORIGINATOR") {
         return raw.clone();
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(val) = codex.originator
@@ -705,14 +724,14 @@ pub fn codex_originator(default: &str) -> String {
 }
 
 pub fn codex_user_agent(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_USER_AGENT") {
         return raw.clone();
     }
     if let Some(raw) = env.get("CCP_USER_AGENT") {
         return raw.clone();
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(ua) = codex.user_agent
@@ -723,11 +742,11 @@ pub fn codex_user_agent(default: &str) -> String {
 }
 
 pub fn codex_previous_response_id() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_PREVIOUS_RESPONSE_ID") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(val) = codex.previous_response_id
@@ -738,7 +757,7 @@ pub fn codex_previous_response_id() -> bool {
 }
 
 pub fn codex_request_compression() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_REQUEST_COMPRESSION") {
         match raw.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => return true,
@@ -746,7 +765,7 @@ pub fn codex_request_compression() -> bool {
             _ => {}
         }
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.request_compression
@@ -757,7 +776,7 @@ pub fn codex_request_compression() -> bool {
 }
 
 pub fn codex_server_compaction() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_SERVER_COMPACTION") {
         match raw.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => return true,
@@ -765,7 +784,7 @@ pub fn codex_server_compaction() -> bool {
             _ => {}
         }
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.server_compaction
@@ -776,11 +795,11 @@ pub fn codex_server_compaction() -> bool {
 }
 
 pub fn codex_responses_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_RESPONSES_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.responses_api
@@ -791,11 +810,11 @@ pub fn codex_responses_api() -> bool {
 }
 
 pub fn codex_full_lane() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_FULL_LANE") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.full_lane
@@ -806,11 +825,11 @@ pub fn codex_full_lane() -> bool {
 }
 
 pub fn codex_images_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_IMAGES_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.images_api
@@ -821,11 +840,11 @@ pub fn codex_images_api() -> bool {
 }
 
 pub fn codex_transcriptions_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_TRANSCRIPTIONS_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.transcriptions_api
@@ -836,11 +855,11 @@ pub fn codex_transcriptions_api() -> bool {
 }
 
 pub fn codex_images_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_IMAGES_BASE_URL") {
         return raw.clone();
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(url) = codex.images_base_url
@@ -851,11 +870,11 @@ pub fn codex_images_base_url() -> String {
 }
 
 pub fn codex_service_tier() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_SERVICE_TIER") {
         return Some(raw.clone());
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
     {
@@ -865,11 +884,11 @@ pub fn codex_service_tier() -> Option<String> {
 }
 
 pub fn codex_effort() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_EFFORT") {
         return Some(raw.clone());
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
     {
@@ -879,14 +898,14 @@ pub fn codex_effort() -> Option<String> {
 }
 
 pub fn codex_reasoning_summary() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env
         .get("CCP_CODEX_REASONING_SUMMARY")
         .filter(|raw| !raw.is_empty())
     {
         return Some(raw.clone());
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(summary) = codex.reasoning_summary.filter(|raw| !raw.is_empty())
@@ -897,11 +916,11 @@ pub fn codex_reasoning_summary() -> Option<String> {
 }
 
 pub fn codex_model() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_MODEL") {
         return Some(raw.clone());
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
     {
@@ -911,14 +930,14 @@ pub fn codex_model() -> Option<String> {
 }
 
 pub fn auto_review_model() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env
         .get("CCP_AUTO_REVIEW_MODEL")
         .filter(|raw| !raw.is_empty())
     {
         return Some(raw.clone());
     }
-    read_file_config(&paths::config_dir())
+    read_file_config(&config_dir())
         .and_then(|file| file.auto_review_model)
         .filter(|model| !model.is_empty())
 }
@@ -954,13 +973,13 @@ fn parse_codex_transport(raw: &str) -> Option<CodexTransport> {
 }
 
 pub fn codex_transport() -> CodexTransport {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CODEX_TRANSPORT")
         && let Some(transport) = parse_codex_transport(raw)
     {
         return transport;
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(transport) = codex.transport.as_deref().and_then(parse_codex_transport)
@@ -987,7 +1006,7 @@ pub const CODEX_DEFAULT_HEADER_TIMEOUT_MS: u64 = 300_000;
 pub const CODEX_MIN_HEADER_TIMEOUT_MS: u64 = 1_000;
 
 pub fn codex_header_timeout_ms() -> u64 {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(ms) = env
         .get("CCP_CODEX_HEADER_TIMEOUT_MS")
         .and_then(|raw| raw.trim().parse::<u64>().ok())
@@ -995,7 +1014,7 @@ pub fn codex_header_timeout_ms() -> u64 {
     {
         return ms;
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(ms) = codex
@@ -1012,11 +1031,11 @@ pub fn codex_header_timeout_ms() -> u64 {
 // ---------------------------------------------------------------------------
 
 pub fn cursor_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CURSOR_BASE_URL") {
         return raw.clone();
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(cursor) = file.cursor
         && let Some(url) = cursor.base_url
@@ -1027,11 +1046,11 @@ pub fn cursor_base_url() -> String {
 }
 
 pub fn cursor_client_version() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CURSOR_CLIENT_VERSION") {
         return raw.clone();
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(cursor) = file.cursor
         && let Some(version) = cursor.client_version
@@ -1062,11 +1081,11 @@ fn detect_cursor_agent_version() -> Option<String> {
 }
 
 pub fn cursor_agent_bundle() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = environment();
     if let Some(raw) = env.get("CCP_CURSOR_AGENT_BUNDLE") {
         return Some(raw.clone());
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(cursor) = file.cursor
         && let Some(bundle) = cursor.agent_bundle
@@ -1090,7 +1109,7 @@ mod tests {
     /// guards drop, including `CCP_CONFIG_DIR`: a plain `remove_var` here would
     /// strip a `CCP_CONFIG_DIR` the developer exported to isolate the whole
     /// run, and every later test in the process that reads config through
-    /// `paths::config_dir()` would fall back to the real config file.
+    /// `config_dir()` would fall back to the real config file.
     fn isolated_env(config: &tempfile::TempDir) -> Vec<EnvGuard> {
         let mut guards = vec![
             EnvGuard::unset("CCP_BIND_ADDRESS"),
@@ -1233,9 +1252,9 @@ mod tests {
         {
             let config = tempfile::TempDir::new().unwrap();
             let _env = isolated_env(&config);
-            assert_eq!(paths::config_dir(), config.path());
+            assert_eq!(config_dir(), config.path());
         }
-        assert_eq!(paths::config_dir(), exported.path());
+        assert_eq!(config_dir(), exported.path());
     }
 
     #[test]

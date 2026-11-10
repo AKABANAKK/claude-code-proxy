@@ -9,6 +9,7 @@ pub mod images;
 pub mod native;
 pub mod request_summary;
 pub mod search;
+mod token_cache;
 pub mod transcription;
 pub mod translate;
 pub mod websocket;
@@ -784,6 +785,7 @@ async fn live_stream_response(
     );
     let mut attempt = 0_u32;
     let mut continuation = Some(continuation);
+    let mut token_estimate = None;
 
     loop {
         let upstream_events = match transport {
@@ -839,12 +841,34 @@ async fn live_stream_response(
             }
         };
 
+        let estimated_input_tokens = match token_estimate {
+            Some(tokens) => tokens,
+            None => {
+                let body = Arc::clone(&request_body);
+                let tokens =
+                    match tokio::task::spawn_blocking(move || count_translated_tokens(&body)).await
+                    {
+                        Ok(tokens) => tokens,
+                        Err(error) => {
+                            cleanup.abort();
+                            return json_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "api_error",
+                                format!("Token estimation failed: {error}"),
+                            );
+                        }
+                    };
+                token_estimate = Some(tokens);
+                tokens
+            }
+        };
         match live_stream_response_once(
             upstream_events,
             message_id.clone(),
             &model,
             ctx.clone(),
             request_continuation.clone(),
+            estimated_input_tokens,
             Arc::clone(&request_body),
             compaction,
             transport,
@@ -943,12 +967,12 @@ async fn live_stream_response_once(
     model: &str,
     ctx: RequestContext,
     request_continuation: ContinuationReservation,
+    estimated_input_tokens: u64,
     request_body: Arc<translate::request::ResponsesRequest>,
     compaction: LiveStreamCompaction,
     configured_transport: config::CodexTransport,
     accept_empty: bool,
 ) -> LiveStreamStart {
-    let estimated_input_tokens = count_translated_tokens(&request_body);
     let collect_finish_metadata = (request_continuation.owner().is_some()
         && request_continuation.turn_id().is_some())
         || compaction.attempt.is_some();
@@ -2206,6 +2230,7 @@ mod tests {
                 "gpt-5.6-sol",
                 ctx,
                 ContinuationReservation::for_owner_turn(None, None),
+                count_translated_tokens(&request_body),
                 request_body,
                 LiveStreamCompaction {
                     compact_boundary: false,
@@ -2246,6 +2271,7 @@ mod tests {
                 "gpt-5.6-sol",
                 ctx,
                 ContinuationReservation::for_owner_turn(None, None),
+                count_translated_tokens(&request_body),
                 request_body,
                 LiveStreamCompaction {
                     compact_boundary: false,
@@ -2331,6 +2357,7 @@ mod tests {
             "claude-opus-4-8",
             ctx,
             continuation,
+            count_translated_tokens(&request_body),
             request_body,
             LiveStreamCompaction {
                 compact_boundary: false,
@@ -2367,6 +2394,7 @@ mod tests {
             "claude-opus-4-8",
             ctx,
             continuation,
+            count_translated_tokens(&request_body),
             request_body,
             LiveStreamCompaction {
                 compact_boundary: false,
@@ -2619,6 +2647,7 @@ mod tests {
             "claude-opus-4-8",
             ctx,
             continuation,
+            count_translated_tokens(&request_body),
             Arc::new(request_body),
             LiveStreamCompaction {
                 compact_boundary: false,
@@ -2736,6 +2765,7 @@ mod tests {
             &request.model,
             live_test_context(session_id),
             ContinuationReservation::for_owner_turn(None, None),
+            count_translated_tokens(&request),
             Arc::new(request.clone()),
             LiveStreamCompaction {
                 compact_boundary: true,
