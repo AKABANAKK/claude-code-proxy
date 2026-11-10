@@ -997,7 +997,7 @@ async fn smoke_codex_model_routes_to_real_provider() {
         body["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("Not authenticated")
+            .contains("No Codex credentials")
     );
 }
 

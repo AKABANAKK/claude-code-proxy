@@ -1260,7 +1260,7 @@ async fn known_model_reaches_codex_provider() {
         body["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("Not authenticated")
+            .contains("No Codex credentials")
     );
 }
 
