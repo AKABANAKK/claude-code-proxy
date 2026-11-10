@@ -11,8 +11,9 @@ use super::IncompleteResponsePolicy;
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
-    BUFFERED_TOOL_MAX_ARGS_BYTES, CodexUsage, FinishMetadata, STOP_END_TURN, STOP_MAX_TOKENS,
-    STOP_TOOL_USE, map_codex_usage_to_anthropic, reasoning_input_item,
+    BUFFERED_TOOL_MAX_ARGS_BYTES, CodexRateLimits, CodexUsage, FinishMetadata, STOP_END_TURN,
+    STOP_MAX_TOKENS, STOP_TOOL_USE, map_codex_usage_to_anthropic, parse_codex_rate_limits,
+    reasoning_input_item,
 };
 use super::request::{ResponsesContentPart, ResponsesInputItem};
 
@@ -85,6 +86,9 @@ pub struct LiveStreamTranslator {
     incomplete_response_policy: IncompleteResponsePolicy,
     finish_metadata: Option<Box<LiveFinishMetadata>>,
     finished: bool,
+    // Latest `codex.rate_limits` event seen on this stream; handed to the
+    // usage mapper at finish so the terminal usage block carries the meter.
+    rate_limits: Option<CodexRateLimits>,
 }
 
 impl LiveStreamTranslator {
@@ -116,6 +120,7 @@ impl LiveStreamTranslator {
             incomplete_response_policy: IncompleteResponsePolicy::Error,
             finish_metadata: None,
             finished: false,
+            rate_limits: None,
         }
     }
 
@@ -167,6 +172,7 @@ impl LiveStreamTranslator {
 
         match kind {
             "codex.rate_limits" => {
+                self.rate_limits = parse_codex_rate_limits(payload).or(self.rate_limits.take());
                 self.emit_ping(traffic, &mut out);
             }
             "keepalive" | "response.created" | "response.in_progress" => {
@@ -1067,7 +1073,10 @@ impl LiveStreamTranslator {
         self.close_open_blocks(traffic, out);
         self.emit_web_searches(traffic, out);
         self.ensure_message_start(traffic, out);
-        let usage = payload.get("response").map(parse_codex_usage);
+        let mut usage = payload.get("response").map(parse_codex_usage);
+        if let Some(usage) = usage.as_mut() {
+            usage.rate_limits = self.rate_limits.clone().map(Box::new);
+        }
         let stop_reason = if self.incomplete_response_policy
             == IncompleteResponsePolicy::AllowMaxOutputTokens
             && is_standard_max_output_tokens_incomplete(payload)
@@ -1276,6 +1285,7 @@ fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
             .get("output_tokens_details")
             .and_then(|d| d.get("reasoning_tokens"))
             .and_then(|v| v.as_u64()),
+        rate_limits: None,
     }
 }
 
@@ -2112,6 +2122,21 @@ mod tests {
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("event: ping"));
         assert!(!out.contains("event: error"));
+
+        let finish = translator
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_1", "status": "completed", "usage": {"input_tokens": 5, "output_tokens": 2}}
+                }),
+                None,
+            )
+            .unwrap();
+        let finish = String::from_utf8(finish).unwrap();
+        assert!(
+            finish.contains(r#""codex_rate_limits":{"limit_reached":true}"#),
+            "{finish}"
+        );
     }
 
     #[test]
