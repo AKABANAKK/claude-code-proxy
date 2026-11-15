@@ -960,7 +960,10 @@ async fn update_against_mock(
     use tokio::io::AsyncWriteExt;
 
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"));
+    // The same fixture can verify an installed release CLI after installation.
+    let executable = std::env::var_os("CCP_ACCOUNTS_TEST_BIN")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_claude-code-proxy").into());
+    let mut command = std::process::Command::new(executable);
     command
         .args(["anthropic", "accounts", "update"])
         .env("CCP_CONFIG_DIR", config.path())
@@ -1257,6 +1260,46 @@ async fn update_does_not_restore_absent_five_hour_or_fable_limits() {
             assert_eq!(listed_cell(&stdout, name, "7d_oi"), "-- (reset --)");
         }
     }
+}
+
+#[tokio::test]
+async fn update_partial_rate_limit_keeps_exhausted_fable_despite_low_weekly_usage() {
+    let config = TempDir::new().unwrap();
+    let name = "limited-fable";
+    register_probe_fixture(&config, &[name]);
+    write_list_usage(
+        &config,
+        name,
+        serde_json::json!({
+            "account":name,"eligible":false,"blockedUntilUnixSecs":4102444800_u64,
+            "windows":{"7d_oi":{"utilization":1.0,"observedAtUnixSecs":42,"resetAtUnixSecs":4102444800_u64}}
+        }),
+    );
+    let output=update_against_mock(&config,&[(name,Some(concat!(
+        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 2\r\nconnection: close\r\nretry-after: 0\r\n",
+        "anthropic-ratelimit-unified-7d-utilization: 0.1\r\n",
+        "anthropic-ratelimit-unified-7d-reset: 4102531200\r\n\r\n{}"
+    )))]).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(list_usage_directory(&config).join(format!("{name}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot["windows"]["7d"]["utilization"], 0.1);
+    assert_eq!(snapshot["windows"]["7d_oi"]["utilization"], 1.0);
+    assert_eq!(snapshot["windows"]["7d_oi"]["observedAtUnixSecs"], 42);
+    assert_eq!(snapshot["eligible"], false);
+    assert_eq!(snapshot["blockedUntilUnixSecs"], 4102444800_u64);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(listed_account(&stdout, name).contains("[リセット待ち]"));
+    assert_eq!(
+        listed_cell(&stdout, name, "available_at"),
+        "2100/01/01 00:00"
+    );
 }
 
 #[tokio::test]
