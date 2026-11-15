@@ -283,7 +283,7 @@ impl AccountPool {
         )
     }
 
-    /// A manual refresh may omit a window. Keep its last observation without
+    /// A failed or rate-limited refresh may omit a window. Keep its last observation without
     /// treating an elapsed reset as confirmation of a new allowance.
     pub(super) fn preserve_unobserved_windows(
         &mut self,

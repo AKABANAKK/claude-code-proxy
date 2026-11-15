@@ -55,10 +55,36 @@ impl AccountRelay {
         };
         let targets = {
             let pool = lock_pool(pool);
-            self.save_all_usage(&pool, now_unix_secs());
             pool.observation_targets()
         };
         let log = create_logger("anthropic");
+        let targets: Vec<_> = targets
+            .into_iter()
+            .map(|selection| {
+                let previous = self.usage_files.as_ref().and_then(|files| {
+                    files.read(&selection.account.name).unwrap_or_else(|err| {
+                        log.warn(
+                            "anthropic_account_usage_read_failed",
+                            Some(serde_json::Map::from_iter([
+                                ("account".into(), serde_json::json!(selection.account.name)),
+                                ("error".into(), serde_json::json!(err.to_string())),
+                            ])),
+                        );
+                        None
+                    })
+                });
+                // Keep old observations until the probe confirms fresh usage.
+                // An empty startup snapshot would otherwise erase Fable limits.
+                if previous.is_none() {
+                    let pool = lock_pool(pool);
+                    self.save_usage(
+                        &selection.account.name,
+                        pool.usage_snapshot(&selection, now_unix_secs()),
+                    );
+                }
+                (selection, previous)
+            })
+            .collect();
         log.info(
             "anthropic_accounts_refresh_started",
             Some(serde_json::Map::from_iter([
@@ -71,14 +97,14 @@ impl AccountRelay {
             ])),
         );
         let mut probes = stream::iter(targets)
-            .map(|selection| async move {
+            .map(|(selection, previous)| async move {
                 let started = Instant::now();
                 let response = probe_account(base_url, &selection.account.token).await;
-                (selection, response, started.elapsed())
+                (selection, response, started.elapsed(), previous)
             })
             .buffer_unordered(USAGE_PROBE_CONCURRENCY);
         let mut failures = 0;
-        while let Some((selection, response, elapsed)) = probes.next().await {
+        while let Some((selection, response, elapsed, previous)) = probes.next().await {
             let mut fields = serde_json::Map::from_iter([
                 ("account".into(), serde_json::json!(selection.account.name)),
                 ("source".into(), serde_json::json!("startup")),
@@ -88,10 +114,14 @@ impl AccountRelay {
                 Ok(response) => {
                     let status = response.status();
                     let observation = ratelimit::observe(response.headers());
+                    let refreshed = status.is_success() && !observation.windows.is_empty();
                     let (events, counts) = {
                         let mut pool = lock_pool(pool);
                         let now = now_unix_secs();
                         let events = pool.observe(&selection, status, &observation, now);
+                        if !refreshed && let Some(previous) = &previous {
+                            pool.preserve_unobserved_windows(&selection, previous, now);
+                        }
                         self.save_usage(
                             &selection.account.name,
                             pool.usage_snapshot(&selection, now),
@@ -104,7 +134,7 @@ impl AccountRelay {
                         serde_json::json!(observation.windows.len()),
                     );
                     log_pool_events(&log, "startup", &events, &counts);
-                    if status.is_success() && !observation.windows.is_empty() {
+                    if refreshed {
                         log.info("anthropic_account_usage_refreshed", Some(fields));
                     } else {
                         failures += 1;
@@ -113,6 +143,13 @@ impl AccountRelay {
                 }
                 Err(err) => {
                     failures += 1;
+                    if let Some(previous) = &previous {
+                        lock_pool(pool).preserve_unobserved_windows(
+                            &selection,
+                            previous,
+                            now_unix_secs(),
+                        );
+                    }
                     fields.extend(upstream_error_details(err).1);
                     log.warn("anthropic_account_usage_refresh_failed", Some(fields));
                 }

@@ -445,6 +445,110 @@ async fn relay_switches_account_after_usage_reaches_threshold() {
 }
 
 #[tokio::test]
+async fn relay_skips_exhausted_fable_even_when_weekly_usage_is_low() {
+    let exhausted = concat!(
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n",
+        "anthropic-ratelimit-unified-7d-utilization: 0.1\r\n",
+        "anthropic-ratelimit-unified-7d-reset: 4102531200\r\n",
+        "anthropic-ratelimit-unified-7d_oi-utilization: 1.0\r\n",
+        "anthropic-ratelimit-unified-7d_oi-reset: 4102444800\r\n\r\n{}"
+    );
+    let (requests, responses) = relay_through_mock_upstream(
+        Some(two_account_pool()),
+        vec![exhausted.as_bytes(), MOCK_OK_RESPONSE, MOCK_OK_RESPONSE],
+        3,
+    )
+    .await;
+    assert_eq!(response_statuses(&responses), vec![StatusCode::OK; 3]);
+    assert!(sent_with(&requests[0], FIRST_TOKEN));
+    assert!(sent_with(&requests[1], SECOND_TOKEN));
+    assert!(sent_with(&requests[2], SECOND_TOKEN));
+}
+
+#[tokio::test]
+async fn startup_partial_rate_limit_preserves_exhausted_fable_and_skips_it() {
+    assert_startup_keeps_fable(
+        concat!("HTTP/1.1 429 Too Many Requests\r\ncontent-length: 2\r\nconnection: close\r\nretry-after: 0\r\n",
+            "anthropic-ratelimit-unified-7d-utilization: 0.1\r\n",
+            "anthropic-ratelimit-unified-7d-reset: 4102531200\r\n\r\n{}").as_bytes(),
+        Some(0.1),
+    ).await;
+    assert_startup_keeps_fable(MOCK_OK_RESPONSE, None).await;
+}
+
+async fn assert_startup_keeps_fable(limited_response: &'static [u8], weekly: Option<f64>) {
+    let directory = tempfile::TempDir::new().unwrap();
+    for name in [FIRST_ACCOUNT_NAME, SECOND_ACCOUNT_NAME] {
+        let snapshot = serde_json::json!({"account":name,"eligible":false,
+            "blockedUntilUnixSecs":4102444800_u64,
+            "windows":{"7d_oi":{"utilization":1.0,"observedAtUnixSecs":42,"resetAtUnixSecs":4102444800_u64}}});
+        std::fs::write(
+            directory.path().join(format!("{name}.json")),
+            snapshot.to_string(),
+        )
+        .unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let mock = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for index in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            let response: &[u8] = if index < 2 && sent_with(&request, FIRST_TOKEN) {
+                limited_response
+            } else {
+                concat!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n",
+                    "anthropic-ratelimit-unified-7d-utilization: 0.1\r\n",
+                    "anthropic-ratelimit-unified-7d-reset: 4102531200\r\n\r\n{}"
+                )
+                .as_bytes()
+            };
+            stream.write_all(response).await.unwrap();
+            requests.push(request);
+        }
+        requests
+    });
+    let provider = AnthropicProvider {
+        base_url,
+        accounts: AccountRelay::with_usage_directory(
+            Some(two_account_pool()),
+            directory.path().to_path_buf(),
+        ),
+    };
+    tokio::time::timeout(Duration::from_secs(5), provider.initialize())
+        .await
+        .unwrap();
+    let read = |name| {
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(directory.path().join(format!("{name}.json"))).unwrap(),
+        )
+        .unwrap()
+    };
+    let blocked = read(FIRST_ACCOUNT_NAME);
+    assert_eq!(blocked["windows"]["7d"]["utilization"].as_f64(), weekly);
+    assert_eq!(blocked["windows"]["7d_oi"]["utilization"], 1.0);
+    assert_eq!(blocked["windows"]["7d_oi"]["observedAtUnixSecs"], 42);
+    assert_eq!(blocked["blockedUntilUnixSecs"], 4102444800_u64);
+    assert_eq!(blocked["eligible"], false);
+    // A successful probe can confirm that this account has no Fable window.
+    let ready = read(SECOND_ACCOUNT_NAME);
+    assert_eq!(ready["eligible"], true);
+    assert!(ready["windows"]["7d_oi"].is_null());
+    let response = tokio::time::timeout(Duration::from_secs(5), relay_request(&provider))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = tokio::time::timeout(Duration::from_secs(5), mock)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(sent_with(requests.last().unwrap(), SECOND_TOKEN));
+}
+
+#[tokio::test]
 async fn relay_returns_rate_limit_when_every_account_rejects_the_request() {
     let (requests, responses) = relay_through_mock_upstream(
         Some(two_account_pool()),
@@ -462,6 +566,38 @@ async fn relay_returns_rate_limit_when_every_account_rejects_the_request() {
     );
     assert!(sent_with(&requests[0], FIRST_TOKEN), "{}", requests[0]);
     assert!(sent_with(&requests[1], SECOND_TOKEN), "{}", requests[1]);
+}
+
+#[tokio::test]
+async fn startup_transport_failure_keeps_known_fable_block() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let previous = serde_json::json!({"account":FIRST_ACCOUNT_NAME,"eligible":false,
+        "blockedUntilUnixSecs":4102444800_u64,
+        "windows":{"7d_oi":{"utilization":1.0,"observedAtUnixSecs":42,"resetAtUnixSecs":4102444800_u64}}}).to_string();
+    let path = directory.path().join(format!("{FIRST_ACCOUNT_NAME}.json"));
+    std::fs::write(&path, &previous).unwrap();
+    let mut provider = AnthropicProvider {
+        base_url: "://invalid".into(),
+        accounts: AccountRelay::with_usage_directory(
+            Some(two_account_pool()),
+            directory.path().to_path_buf(),
+        ),
+    };
+    provider.initialize().await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    provider.base_url = format!("http://{}", listener.local_addr().unwrap());
+    let mock = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await;
+        stream.write_all(MOCK_OK_RESPONSE).await.unwrap();
+        request
+    });
+    let response = tokio::time::timeout(Duration::from_secs(5), relay_request(&provider))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(sent_with(&mock.await.unwrap(), SECOND_TOKEN));
 }
 
 #[tokio::test]

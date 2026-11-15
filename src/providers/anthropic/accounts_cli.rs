@@ -406,7 +406,11 @@ async fn update_account_usage(accounts: Vec<accounts::StoredAnthropicAccount>) -
             .unwrap_or_default()
             .as_secs();
         pool.observe(&selection, status, &observation, now);
-        if !has_usage && let Some(previous) = &previous {
+        // An error may report only the unaffected weekly window. It cannot
+        // confirm that an omitted, previously exhausted Fable window is gone.
+        if (!status.is_success() || !has_usage)
+            && let Some(previous) = &previous
+        {
             pool.preserve_unobserved_windows(&selection, previous, now);
         }
         let mut snapshot = pool.usage_snapshot(&selection, now);
