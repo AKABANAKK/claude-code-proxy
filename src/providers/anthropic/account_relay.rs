@@ -24,6 +24,7 @@ pub(super) const USAGE_PROBE_CONCURRENCY: usize = 3;
 pub(super) struct AccountRelay {
     pool: Option<Mutex<AccountPool>>,
     usage_files: Option<UsageFiles>,
+    last_refresh: tokio::sync::Mutex<Option<(SystemTime, u64)>>,
 }
 
 impl AccountRelay {
@@ -38,6 +39,7 @@ impl AccountRelay {
         Self {
             pool: pool.map(Mutex::new),
             usage_files: None,
+            last_refresh: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -175,6 +177,64 @@ impl AccountRelay {
         }
     }
 
+    async fn sync_usage_refresh(&self, pool: &Mutex<AccountPool>, log: &Logger, req_id: &str) {
+        if let Err(err) = self.load_usage_refresh(pool, log, req_id).await {
+            log.warn(
+                "anthropic_accounts_usage_reload_failed",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".into(), serde_json::json!(req_id)),
+                    ("error".into(), serde_json::json!(err.to_string())),
+                ])),
+            );
+        }
+    }
+
+    async fn load_usage_refresh(
+        &self,
+        pool: &Mutex<AccountPool>,
+        log: &Logger,
+        req_id: &str,
+    ) -> anyhow::Result<()> {
+        let Some(files) = &self.usage_files else {
+            return Ok(());
+        };
+        // Serialize refresh imports, but never hold the account pool during I/O.
+        let mut previous = self.last_refresh.lock().await;
+        let path = files.refresh_path();
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        let stamp = (metadata.modified()?, metadata.len());
+        if previous.as_ref() == Some(&stamp) {
+            return Ok(());
+        }
+        let refresh: Value = serde_json::from_slice(&tokio::fs::read(path).await?)?;
+        let snapshots = refresh["accounts"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Invalid account usage refresh"))?;
+        let (updated, mut fields) = {
+            let mut pool = lock_pool(pool);
+            let now = now_unix_secs();
+            let updated = snapshots
+                .iter()
+                .filter(|snapshot| pool.apply_usage_refresh(snapshot, now))
+                .count();
+            if updated > 0 {
+                self.save_all_usage(&pool, now);
+            }
+            (updated, pool.count_fields(now))
+        };
+        *previous = Some(stamp);
+        if updated > 0 {
+            fields.insert("reqId".into(), serde_json::json!(req_id));
+            fields.insert("updatedAccountCount".into(), serde_json::json!(updated));
+            log.info("anthropic_accounts_usage_reloaded", Some(fields));
+        }
+        Ok(())
+    }
+
     pub(super) async fn send(
         &self,
         builder: reqwest::RequestBuilder,
@@ -189,6 +249,7 @@ impl AccountRelay {
         let log = create_logger("anthropic");
         let mut tried_accounts = Vec::new();
         let mut rejected = None;
+        self.sync_usage_refresh(pool, &log, req_id).await;
         while let Some(selection) = select_account(pool, &tried_accounts) {
             let Some(mut attempt) = request.try_clone() else {
                 return Err(json_error(
@@ -699,6 +760,7 @@ mod tests {
                 None,
             ))),
             usage_files: Some(files),
+            last_refresh: tokio::sync::Mutex::new(None),
         };
         let release = ReleaseWriterOnDrop(release);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

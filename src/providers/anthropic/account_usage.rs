@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde_json::{Value, json};
@@ -49,6 +50,15 @@ pub(super) fn timestamp(seconds: u64) -> Option<String> {
         .ok()
 }
 
+pub(super) fn now_unix_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 pub(super) struct UsageFiles {
     directory: PathBuf,
     writer: OnceLock<io::Result<UsageWriter>>,
@@ -84,6 +94,19 @@ impl UsageFiles {
     /// Explicit CLI updates report storage failures to the caller.
     pub fn save(&self, account: &str, snapshot: &Value) -> anyhow::Result<()> {
         write_snapshot(&self.directory, account, snapshot)
+    }
+
+    pub fn refresh_path(&self) -> PathBuf {
+        self.directory.join(".refresh").join("latest.json")
+    }
+
+    /// Separate from runtime snapshots so queued writes cannot erase CLI updates.
+    pub fn publish_refresh(&self, snapshots: &[Value]) -> anyhow::Result<()> {
+        write_snapshot(
+            &self.directory.join(".refresh"),
+            "latest",
+            &json!({"accounts": snapshots}),
+        )
     }
 
     /// Call while holding the pool lock to preserve observation order. Only the

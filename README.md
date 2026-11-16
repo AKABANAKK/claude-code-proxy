@@ -154,7 +154,7 @@ one. Set `CCP_ANTHROPIC_SWITCH_THRESHOLD=0.95` (or `95`) to switch at 95%, or
 On HTTP 429, the proxy temporarily blocks the account and retries the same
 request with another account, trying each account at most once. If no further
 account can be selected, it returns the last 429. A 401 invalidates that account
-until restart and is returned immediately. If all registered accounts are
+until a successful explicit usage refresh or restart, and is returned immediately. If all registered accounts are
 invalid, subsequent requests use Claude Code's original login.
 
 The selected account, block reason, and retries appear in `proxy.log` as
@@ -181,6 +181,10 @@ are combined into the newest snapshot. Startup and normal shutdown wait for
 pending saves. See
 [Files and storage](docs/src/content/docs/reference/files-and-storage.md)
 for snapshot freshness, refresh logs, and field details.
+
+`anthropic accounts update` also updates the running proxy before its next
+request. Fresh observations can release cached blocks without restarting the
+proxy; older observations cannot overwrite a newer upstream response.
 
 Switching accounts
 can lose prompt-cache reuse and increase usage on the next request. With no

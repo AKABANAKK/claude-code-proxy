@@ -373,6 +373,7 @@ async fn update_account_usage(accounts: Vec<accounts::StoredAnthropicAccount>) -
         })
         .buffer_unordered(USAGE_PROBE_CONCURRENCY);
     let mut updated = 0;
+    let mut refreshes = Vec::new();
     while let Some((selection, response)) = probes.next().await {
         let name = &selection.account.name;
         let response = match response {
@@ -426,11 +427,18 @@ async fn update_account_usage(accounts: Vec<accounts::StoredAnthropicAccount>) -
             eprintln!("Cannot save usage for {name}: {err:#}");
             continue;
         }
+        refreshes.push(snapshot);
         if refreshed {
             updated += 1;
         } else {
             eprintln!("Cannot update usage for {name}: HTTP {status}");
         }
+    }
+    if !refreshes.is_empty()
+        && let Err(err) = usage.publish_refresh(&refreshes)
+    {
+        eprintln!("Cannot publish usage updates to the running proxy: {err:#}");
+        return 0;
     }
     updated
 }
