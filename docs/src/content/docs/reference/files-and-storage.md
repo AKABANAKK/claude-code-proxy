@@ -91,18 +91,32 @@ from the startup probes.
 Commands such as `models` or `kimi auth status` do not query accounts or create
 or overwrite snapshots. Files are replaced atomically; a write failure produces
 `anthropic_account_usage_write_failed` without failing requests or startup.
-Snapshots are not read back to restore pool state after a restart: old data is
-replaced with unknown values at startup, then filled from the new probes.
+Successful startup probes replace old window observations. Failed or empty probes
+retain previously saved windows so an omitted exhausted limit is not lost.
 
 `anthropic accounts update` explicitly probes all registered accounts and saves
 the refreshed snapshots before returning. It preserves the last selection.
-When a probe returns usage headers, its reported window set replaces the old
+When a successful probe returns usage headers, its reported window set replaces the old
 snapshot: omitted windows such as `5h` or `7d_oi` remain `null` and do not affect
 availability, rather than being restored from an older observation. Connection failures,
 server errors, and responses without usage headers preserve the previous usage;
 401 and 429 responses can still update invalidation or block status. Storage
-failures and partial refresh failures cause a nonzero exit. This command updates
-the files used by `accounts list`; a running proxy keeps its own in-memory pool.
+failures and partial refresh failures cause a nonzero exit.
+
+Explicit updates are also published atomically to
+`<state-root>/anthropic/accounts/.refresh/latest.json`, separately from the
+background snapshot writer. Before selecting an account for a request, running
+proxies import newer observations and recompute eligibility, releasing cached
+blocks when a successful probe confirms fresh allowance. Unchanged update files
+are not parsed again. The pool lock is not held during file I/O, and a failed
+import leaves the current pool intact. The `anthropic_accounts_usage_reloaded`
+event records imported updates. Restarting is not required for usage updates;
+registration changes still require a restart.
+
+Observation times include microseconds so an older CLI response cannot replace
+a newer upstream rejection even when both arrive in the same second. Partial
+429 responses retain unobserved windows, and failed or empty probes do not
+release known limits.
 
 | Field | Meaning |
 | --- | --- |
@@ -110,6 +124,7 @@ the files used by `accounts list`; a running proxy keeps its own in-memory pool.
 | `active` | Whether this was the last account selected for a normal request when the snapshot was written. Startup probes do not select an account. |
 | `asOf` / `asOfUnixSecs` | Snapshot time, as UTC RFC 3339 / Unix seconds. |
 | `lastResponseAt` / `lastResponseStatus` | Last upstream response observed for this account, or `null`. |
+| `lastResponseAtUnixMicros` | Ordering timestamp for response observations, used when importing explicit usage refreshes. |
 | `switchThreshold` | Usage threshold used by the running proxy, normally `0.98`. |
 | `eligible` | Whether the local pool permits selection at `asOf`; this is not confirmation of remaining upstream allowance. |
 | `invalid` | Whether a 401 has invalidated the account in this process. |

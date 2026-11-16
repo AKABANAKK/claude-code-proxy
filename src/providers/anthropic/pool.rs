@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
-use super::account_usage::{ObservedWindow, timestamp};
+use super::account_usage::{ObservedWindow, now_unix_micros, timestamp};
 use super::ratelimit::{RateLimitObservation, WATCHED_WINDOWS, WindowUsage};
 
 const FIRST_ACCOUNT_INDEX: usize = 0;
@@ -26,6 +26,7 @@ struct AccountState {
     invalid: bool,
     windows: BTreeMap<&'static str, ObservedWindow>,
     last_response_at: Option<u64>,
+    last_response_at_micros: Option<u64>,
     last_response_status: Option<u16>,
 }
 
@@ -37,6 +38,7 @@ impl AccountState {
             invalid: false,
             windows: BTreeMap::new(),
             last_response_at: None,
+            last_response_at_micros: None,
             last_response_status: None,
         }
     }
@@ -74,6 +76,7 @@ impl AccountState {
             "asOf": timestamp(now),
             "asOfUnixSecs": now,
             "lastResponseAt": self.last_response_at.and_then(timestamp),
+            "lastResponseAtUnixMicros": self.last_response_at_micros,
             "lastResponseStatus": self.last_response_status,
             "switchThreshold": threshold,
             "eligible": self.is_available(now),
@@ -187,6 +190,7 @@ impl AccountPool {
         let account = &selection.account.name;
         let state = &mut self.accounts[selection.index];
         state.last_response_at = Some(now_unix_secs);
+        state.last_response_at_micros = Some(now_unix_micros());
         state.last_response_status = Some(status.as_u16());
         for usage in &observation.windows {
             state.windows.insert(
@@ -238,6 +242,93 @@ impl AccountPool {
 
     pub fn len(&self) -> usize {
         self.accounts.len()
+    }
+
+    /// An explicit, newer CLI refresh replaces cached eligibility. Ordinary
+    /// responses only extend blocks; a confirmed refresh can release them.
+    pub(super) fn apply_usage_refresh(&mut self, snapshot: &Value, now: u64) -> bool {
+        let Some(state) = self
+            .accounts
+            .iter_mut()
+            .find(|state| snapshot["account"].as_str() == Some(state.account.name.as_str()))
+        else {
+            return false;
+        };
+        let Some(observed_at) = snapshot["lastResponseAtUnixMicros"].as_u64() else {
+            return false;
+        };
+        if state
+            .last_response_at_micros
+            .is_some_and(|last| last >= observed_at)
+        {
+            return false;
+        }
+        let Some(status) = snapshot["lastResponseStatus"]
+            .as_u64()
+            .and_then(|status| u16::try_from(status).ok())
+            .and_then(|status| StatusCode::from_u16(status).ok())
+        else {
+            return false;
+        };
+        if !status.is_success()
+            && status != StatusCode::TOO_MANY_REQUESTS
+            && status != StatusCode::UNAUTHORIZED
+        {
+            return false;
+        }
+        let mut windows = BTreeMap::new();
+        for window in WATCHED_WINDOWS {
+            let usage = &snapshot["windows"][window];
+            if usage.is_null() {
+                continue;
+            }
+            let Some(utilization) = usage["utilization"]
+                .as_f64()
+                .filter(|value| value.is_finite() && *value >= 0.0)
+            else {
+                return false;
+            };
+            let Some(observed_at) = usage["observedAtUnixSecs"].as_u64() else {
+                return false;
+            };
+            windows.insert(
+                window,
+                ObservedWindow {
+                    usage: WindowUsage {
+                        window,
+                        utilization,
+                        reset_at_unix_secs: usage["resetAtUnixSecs"].as_u64(),
+                    },
+                    observed_at,
+                },
+            );
+        }
+        if status.is_success() && windows.is_empty() {
+            return false;
+        }
+        state.windows = windows;
+        state.last_response_at = Some(observed_at / 1_000_000);
+        state.last_response_at_micros = Some(observed_at);
+        state.last_response_status = Some(status.as_u16());
+        state.invalid = status == StatusCode::UNAUTHORIZED;
+        state.blocked_until = None;
+        for observed in state.windows.values() {
+            if observed.usage.utilization >= self.threshold {
+                let until = observed
+                    .usage
+                    .reset_at_unix_secs
+                    .unwrap_or_else(|| now.saturating_add(BLOCK_WITHOUT_RESET_HEADER_SECS));
+                state.blocked_until = Some(state.blocked_until.map_or(until, |old| old.max(until)));
+            }
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            state.block_until(
+                snapshot["blockedUntilUnixSecs"]
+                    .as_u64()
+                    .unwrap_or_else(|| now.saturating_add(BLOCK_WITHOUT_RESET_HEADER_SECS)),
+            );
+        }
+        true
     }
 
     pub fn is_empty(&self) -> bool {
@@ -443,6 +534,131 @@ mod tests {
             .select(NOW_UNIX_SECS, &[])
             .expect("pool selects an account");
         pool.observe(&selection, status, observation, NOW_UNIX_SECS)
+    }
+
+    #[test]
+    fn explicit_refresh_releases_old_blocks_and_clears_confirmed_absent_windows() {
+        let mut running = pool_of(&["first", "second"], None);
+        let selection = running.select(NOW_UNIX_SECS, &[]).unwrap();
+        running.observe(
+            &selection,
+            StatusCode::OK,
+            &usage(FABLE_WEEKLY_WINDOW, 1.0, Some(LATE_RECOVERY_UNIX_SECS)),
+            NOW_UNIX_SECS,
+        );
+        running.observe(
+            &selection,
+            StatusCode::OK,
+            &usage(FIVE_HOUR_WINDOW, 1.0, Some(MIDDLE_RECOVERY_UNIX_SECS)),
+            NOW_UNIX_SECS,
+        );
+        assert_eq!(
+            active_name(&mut running, NOW_UNIX_SECS).as_deref(),
+            Some("second")
+        );
+
+        let mut refreshed = pool_of(&["first"], None);
+        let selected = refreshed.select(NOW_UNIX_SECS, &[]).unwrap();
+        refreshed.observe(
+            &selected,
+            StatusCode::OK,
+            &usage(WEEKLY_WINDOW, 0.23, Some(LATE_RECOVERY_UNIX_SECS)),
+            NOW_UNIX_SECS,
+        );
+        let snapshot = refreshed.usage_snapshot(&selected, NOW_UNIX_SECS);
+        assert!(running.apply_usage_refresh(&snapshot, NOW_UNIX_SECS));
+        let restored = running.usage_snapshot(&selection, NOW_UNIX_SECS);
+        assert_eq!(restored["eligible"], true);
+        assert!(restored["windows"]["5h"].is_null());
+        assert!(restored["windows"]["7d_oi"].is_null());
+        // Recovering an account must not interrupt an account that is still usable.
+        assert_eq!(
+            active_name(&mut running, NOW_UNIX_SECS).as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            running
+                .select(NOW_UNIX_SECS, &["second".into()])
+                .unwrap()
+                .account
+                .name,
+            "first"
+        );
+    }
+
+    #[test]
+    fn explicit_refresh_cannot_replay_over_a_newer_upstream_rejection() {
+        let mut refreshed = pool_of(&["first"], None);
+        let selection = refreshed.select(NOW_UNIX_SECS, &[]).unwrap();
+        refreshed.observe(
+            &selection,
+            StatusCode::OK,
+            &usage(FABLE_WEEKLY_WINDOW, 0.26, Some(LATE_RECOVERY_UNIX_SECS)),
+            NOW_UNIX_SECS,
+        );
+        let snapshot = refreshed.usage_snapshot(&selection, NOW_UNIX_SECS);
+        let mut running = pool_of(&["first", "second"], None);
+        assert!(running.apply_usage_refresh(&snapshot, NOW_UNIX_SECS));
+        let selection = running.select(NOW_UNIX_SECS, &[]).unwrap();
+        running.observe(
+            &selection,
+            StatusCode::TOO_MANY_REQUESTS,
+            &usage(FABLE_WEEKLY_WINDOW, 1.0, Some(LATE_RECOVERY_UNIX_SECS)),
+            NOW_UNIX_SECS,
+        );
+        assert!(!running.apply_usage_refresh(&snapshot, NOW_UNIX_SECS));
+        assert_eq!(
+            active_name(&mut running, NOW_UNIX_SECS).as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            running.usage_snapshot(&selection, NOW_UNIX_SECS)["windows"]["7d_oi"]["utilization"],
+            1.0
+        );
+    }
+
+    #[test]
+    fn failed_or_empty_explicit_refresh_cannot_release_a_known_limit() {
+        let mut running = pool_of(&["first", "second"], None);
+        let selection = running.select(NOW_UNIX_SECS, &[]).unwrap();
+        running.observe(
+            &selection,
+            StatusCode::OK,
+            &usage(FABLE_WEEKLY_WINDOW, 1.0, Some(LATE_RECOVERY_UNIX_SECS)),
+            NOW_UNIX_SECS,
+        );
+        let mut refreshed = pool_of(&["first"], None);
+        let selected = refreshed.select(NOW_UNIX_SECS, &[]).unwrap();
+        refreshed.observe(
+            &selected,
+            StatusCode::OK,
+            &usage(FABLE_WEEKLY_WINDOW, 0.26, Some(LATE_RECOVERY_UNIX_SECS)),
+            NOW_UNIX_SECS,
+        );
+        let snapshot = refreshed.usage_snapshot(&selected, NOW_UNIX_SECS);
+        for invalid in [
+            {
+                let mut s = snapshot.clone();
+                s["lastResponseStatus"] = json!(503);
+                s
+            },
+            {
+                let mut s = snapshot.clone();
+                s["windows"] = json!({});
+                s
+            },
+            {
+                let mut s = snapshot.clone();
+                s["lastResponseAtUnixMicros"] = Value::Null;
+                s
+            },
+        ] {
+            assert!(!running.apply_usage_refresh(&invalid, NOW_UNIX_SECS));
+            assert_eq!(
+                running.usage_snapshot(&selection, NOW_UNIX_SECS)["eligible"],
+                false
+            );
+        }
     }
 
     #[test]

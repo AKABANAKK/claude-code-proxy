@@ -952,6 +952,11 @@ const MOCK_UPDATED_USAGE: &str = concat!(
     "anthropic-ratelimit-unified-7d_oi-reset: 4102531200\r\n\r\n{}"
 );
 
+fn accounts_test_executable() -> std::ffi::OsString {
+    std::env::var_os("CCP_ACCOUNTS_TEST_BIN")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_claude-code-proxy").into())
+}
+
 async fn update_against_mock(
     config: &TempDir,
     responses: &[(&str, Option<&str>)],
@@ -961,9 +966,7 @@ async fn update_against_mock(
 
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     // The same fixture can verify an installed release CLI after installation.
-    let executable = std::env::var_os("CCP_ACCOUNTS_TEST_BIN")
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_claude-code-proxy").into());
-    let mut command = std::process::Command::new(executable);
+    let mut command = std::process::Command::new(accounts_test_executable());
     command
         .args(["anthropic", "accounts", "update"])
         .env("CCP_CONFIG_DIR", config.path())
@@ -1005,6 +1008,133 @@ async fn update_against_mock(
     assert!(!String::from_utf8_lossy(&output.stdout).contains("test-token-"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("test-token-"));
     output
+}
+
+#[tokio::test]
+async fn update_releases_cached_blocks_in_a_running_proxy_without_restart() {
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    const EXHAUSTED: &str = concat!(
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n",
+        "anthropic-ratelimit-unified-7d-utilization: 0.23\r\n",
+        "anthropic-ratelimit-unified-7d_oi-utilization: 1.0\r\n",
+        "anthropic-ratelimit-unified-7d_oi-reset: 4102444800\r\n\r\n{}"
+    );
+    const REJECTED: &str = concat!(
+        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 2\r\nconnection: close\r\n",
+        "anthropic-ratelimit-unified-7d-utilization: 0.23\r\n",
+        "anthropic-ratelimit-unified-7d_oi-utilization: 1.0\r\n",
+        "anthropic-ratelimit-unified-7d_oi-reset: 4102444800\r\n\r\n{}"
+    );
+    const RECOVERED: &str = concat!(
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n",
+        "anthropic-ratelimit-unified-7d-utilization: 0.23\r\n",
+        "anthropic-ratelimit-unified-7d_oi-utilization: 0.26\r\n",
+        "anthropic-ratelimit-unified-7d_oi-reset: 4102444800\r\n\r\n{}"
+    );
+    let config = TempDir::new().unwrap();
+    register_probe_fixture(&config, &["first", "second"]);
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", upstream.local_addr().unwrap());
+    let mock = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for _ in 0..4 {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let (headers, body) = read_probe_request(&mut stream).await;
+            let response = if body["max_tokens"] == 1 {
+                EXHAUSTED
+            } else if headers.contains("Bearer test-token-second\r\n") {
+                RECOVERED
+            } else {
+                REJECTED
+            };
+            stream.write_all(response.as_bytes()).await.unwrap();
+            requests.push(headers);
+        }
+        requests
+    });
+    let _proxy = ProxyProcess(
+        std::process::Command::new(accounts_test_executable())
+            .args(["serve", "--no-monitor", "--port", "0"])
+            .env("CCP_CONFIG_DIR", config.path())
+            .env("XDG_STATE_HOME", config.path())
+            .env("LOCALAPPDATA", config.path())
+            .env("CCP_BIND_ADDRESS", "127.0.0.1")
+            .env("CCP_ANTHROPIC_BASE_URL", base_url)
+            .env("CCP_ANTHROPIC_SWITCH_THRESHOLD", "98")
+            .env("CCP_ANTHROPIC_ACTIVE_ACCOUNT", "first")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let port = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let log = std::fs::read_to_string(config.path().join("claude-code-proxy/proxy.log"))
+                .unwrap_or_default();
+            if let Some(port) = log
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|row| row["msg"] == "server listening")
+                .and_then(|row| row["fields"]["port"].as_u64())
+            {
+                break port;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("test proxy should finish its synthetic startup probes");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let request = || {
+        client
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .bearer_auth("test-original-token")
+            .json(
+                &serde_json::json!({"model":"claude-fable-5-2","max_tokens":16,
+            "messages":[{"role":"user","content":"test"}]}),
+            )
+    };
+    let before = request().send().await.unwrap();
+    assert_eq!(before.status(), 429);
+    before.bytes().await.unwrap();
+    let updated = update_against_mock(
+        &config,
+        &[("first", Some(concat!(
+            "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 2\r\nconnection: close\r\nretry-after: 0\r\n",
+            "anthropic-ratelimit-unified-7d-utilization: 0.23\r\n\r\n{}"
+        ))), ("second", Some(RECOVERED))],
+    )
+    .await;
+    assert!(
+        updated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&updated.stderr)
+    );
+    let after = request().send().await.unwrap();
+    let status = after.status();
+    after.bytes().await.unwrap();
+    let requests = tokio::time::timeout(Duration::from_secs(5), mock)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        requests
+            .last()
+            .unwrap()
+            .contains("Bearer test-token-second\r\n"),
+        "the next request must use the recovered account without restarting the proxy"
+    );
+    assert_eq!(status, 200);
 }
 
 #[tokio::test]
@@ -1319,6 +1449,18 @@ async fn update_reports_usage_write_failures() {
             .contains("Cannot save usage for first:")
     );
     assert!(snapshot_path.is_dir());
+}
+
+#[tokio::test]
+async fn update_reports_failure_to_publish_to_running_proxies() {
+    let config = TempDir::new().unwrap();
+    register_probe_fixture(&config, &["first"]);
+    let usage = list_usage_directory(&config);
+    std::fs::create_dir_all(&usage).unwrap();
+    std::fs::write(usage.join(".refresh"), "not a directory").unwrap();
+    let output = update_against_mock(&config, &[("first", Some(MOCK_UPDATED_USAGE))]).await;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Cannot publish usage updates"));
 }
 
 #[tokio::test]
