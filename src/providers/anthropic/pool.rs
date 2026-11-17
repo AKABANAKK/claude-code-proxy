@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
-use super::account_usage::{ObservedWindow, now_unix_micros, timestamp};
+use super::account_usage::{ObservedWindow, now_unix_micros, timestamp, window_revision};
 use super::ratelimit::{RateLimitObservation, WATCHED_WINDOWS, WindowUsage};
 
 const FIRST_ACCOUNT_INDEX: usize = 0;
@@ -23,6 +23,9 @@ struct AccountState {
     account: PoolAccount,
     /// Unix time in seconds.
     blocked_until: Option<u64>,
+    retry_until: Option<u64>,
+    block_status_at_micros: Option<u64>,
+    window_versions: BTreeMap<&'static str, u64>,
     invalid: bool,
     windows: BTreeMap<&'static str, ObservedWindow>,
     last_response_at: Option<u64>,
@@ -35,6 +38,9 @@ impl AccountState {
         Self {
             account,
             blocked_until: None,
+            retry_until: None,
+            block_status_at_micros: None,
+            window_versions: BTreeMap::new(),
             invalid: false,
             windows: BTreeMap::new(),
             last_response_at: None,
@@ -51,11 +57,22 @@ impl AccountState {
             .is_none_or(|blocked_until| blocked_until <= now_unix_secs)
     }
 
-    fn block_until(&mut self, until_unix_secs: u64) {
-        let later = self.blocked_until.map_or(until_unix_secs, |blocked_until| {
-            blocked_until.max(until_unix_secs)
-        });
-        self.blocked_until = Some(later);
+    fn block_retry_until(&mut self, until: u64) {
+        self.retry_until = Some(self.retry_until.map_or(until, |old| old.max(until)));
+    }
+
+    fn recompute_block(&mut self, threshold: f64) {
+        self.blocked_until = self.retry_until;
+        for observed in self.windows.values() {
+            if observed.usage.utilization >= threshold {
+                let until = observed.usage.reset_at_unix_secs.unwrap_or_else(|| {
+                    observed
+                        .observed_at
+                        .saturating_add(BLOCK_WITHOUT_RESET_HEADER_SECS)
+                });
+                self.blocked_until = Some(self.blocked_until.map_or(until, |old| old.max(until)));
+            }
+        }
     }
 
     fn usage_snapshot(&self, now: u64, threshold: f64, active: bool) -> Value {
@@ -77,6 +94,9 @@ impl AccountState {
             "asOfUnixSecs": now,
             "lastResponseAt": self.last_response_at.and_then(timestamp),
             "lastResponseAtUnixMicros": self.last_response_at_micros,
+            "blockStatusAtUnixMicros": self.block_status_at_micros,
+            "retryAfterUntilUnixSecs": self.retry_until,
+            "windowUpdatedAtUnixMicros": self.window_versions,
             "lastResponseStatus": self.last_response_status,
             "switchThreshold": threshold,
             "eligible": self.is_available(now),
@@ -190,9 +210,11 @@ impl AccountPool {
         let account = &selection.account.name;
         let state = &mut self.accounts[selection.index];
         state.last_response_at = Some(now_unix_secs);
-        state.last_response_at_micros = Some(now_unix_micros());
+        let revision = now_unix_micros();
+        state.last_response_at_micros = Some(revision);
         state.last_response_status = Some(status.as_u16());
         for usage in &observation.windows {
+            state.window_versions.insert(usage.window, revision);
             state.windows.insert(
                 usage.window,
                 ObservedWindow {
@@ -203,6 +225,8 @@ impl AccountPool {
         }
         if status == StatusCode::UNAUTHORIZED {
             state.invalid = true;
+            state.block_status_at_micros = Some(revision);
+            state.recompute_block(threshold);
             return vec![PoolEvent::Invalidated {
                 account: account.clone(),
             }];
@@ -213,7 +237,6 @@ impl AccountPool {
                 let until_unix_secs = usage.reset_at_unix_secs.unwrap_or_else(|| {
                     now_unix_secs.saturating_add(BLOCK_WITHOUT_RESET_HEADER_SECS)
                 });
-                state.block_until(until_unix_secs);
                 events.push(PoolEvent::Blocked {
                     account: account.clone(),
                     reason: BlockReason::Utilization {
@@ -230,13 +253,15 @@ impl AccountPool {
                     .retry_after_secs
                     .unwrap_or(BLOCK_WITHOUT_RESET_HEADER_SECS),
             );
-            state.block_until(until_unix_secs);
+            state.block_retry_until(until_unix_secs);
+            state.block_status_at_micros = Some(revision);
             events.push(PoolEvent::Blocked {
                 account: account.clone(),
                 reason: BlockReason::TooManyRequests,
                 until_unix_secs,
             });
         }
+        state.recompute_block(threshold);
         events
     }
 
@@ -244,9 +269,9 @@ impl AccountPool {
         self.accounts.len()
     }
 
-    /// An explicit, newer CLI refresh replaces cached eligibility. Ordinary
-    /// responses only extend blocks; a confirmed refresh can release them.
-    pub(super) fn apply_usage_refresh(&mut self, snapshot: &Value, now: u64) -> bool {
+    /// Merge each quota window independently; an unrelated newer response must
+    /// not discard a pending observation for another window.
+    pub(super) fn apply_usage_refresh(&mut self, snapshot: &Value, _now: u64) -> bool {
         let Some(state) = self
             .accounts
             .iter_mut()
@@ -254,19 +279,13 @@ impl AccountPool {
         else {
             return false;
         };
-        let Some(observed_at) = snapshot["lastResponseAtUnixMicros"].as_u64() else {
+        let Some(revision) = snapshot["lastResponseAtUnixMicros"].as_u64() else {
             return false;
         };
-        if state
-            .last_response_at_micros
-            .is_some_and(|last| last >= observed_at)
-        {
-            return false;
-        }
         let Some(status) = snapshot["lastResponseStatus"]
             .as_u64()
-            .and_then(|status| u16::try_from(status).ok())
-            .and_then(|status| StatusCode::from_u16(status).ok())
+            .and_then(|n| u16::try_from(n).ok())
+            .and_then(|n| StatusCode::from_u16(n).ok())
         else {
             return false;
         };
@@ -276,57 +295,86 @@ impl AccountPool {
         {
             return false;
         }
-        let mut windows = BTreeMap::new();
+        let mut changes = Vec::new();
+        let mut has_usage = false;
         for window in WATCHED_WINDOWS {
-            let usage = &snapshot["windows"][window];
-            if usage.is_null() {
-                continue;
-            }
-            let Some(utilization) = usage["utilization"]
-                .as_f64()
-                .filter(|value| value.is_finite() && *value >= 0.0)
-            else {
-                return false;
-            };
-            let Some(observed_at) = usage["observedAtUnixSecs"].as_u64() else {
-                return false;
-            };
-            windows.insert(
-                window,
-                ObservedWindow {
+            let raw = &snapshot["windows"][window];
+            let observed = if raw.is_null() {
+                None
+            } else {
+                let Some(utilization) = raw["utilization"]
+                    .as_f64()
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                else {
+                    return false;
+                };
+                let Some(observed_at) = raw["observedAtUnixSecs"].as_u64() else {
+                    return false;
+                };
+                has_usage = true;
+                Some(ObservedWindow {
                     usage: WindowUsage {
                         window,
                         utilization,
-                        reset_at_unix_secs: usage["resetAtUnixSecs"].as_u64(),
+                        reset_at_unix_secs: raw["resetAtUnixSecs"].as_u64(),
                     },
                     observed_at,
-                },
-            );
+                })
+            };
+            changes.push((window, window_revision(snapshot, window), observed));
         }
-        if status.is_success() && windows.is_empty() {
+        if status.is_success() && !has_usage {
             return false;
         }
-        state.windows = windows;
-        state.last_response_at = Some(observed_at / 1_000_000);
-        state.last_response_at_micros = Some(observed_at);
-        state.last_response_status = Some(status.as_u16());
-        state.invalid = status == StatusCode::UNAUTHORIZED;
-        state.blocked_until = None;
-        for observed in state.windows.values() {
-            if observed.usage.utilization >= self.threshold {
-                let until = observed
-                    .usage
-                    .reset_at_unix_secs
-                    .unwrap_or_else(|| now.saturating_add(BLOCK_WITHOUT_RESET_HEADER_SECS));
-                state.blocked_until = Some(state.blocked_until.map_or(until, |old| old.max(until)));
+        let mut changed = false;
+        for (window, version, observed) in changes {
+            if version <= state.window_versions.get(window).copied().unwrap_or(0) {
+                continue;
             }
+            state.window_versions.insert(window, version);
+            if let Some(observed) = observed {
+                state.windows.insert(window, observed);
+            } else {
+                state.windows.remove(window);
+            }
+            changed = true;
         }
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            state.block_until(
-                snapshot["blockedUntilUnixSecs"]
+        if state
+            .block_status_at_micros
+            .is_none_or(|last| revision > last)
+        {
+            state.invalid = status == StatusCode::UNAUTHORIZED;
+            state.retry_until = if status == StatusCode::TOO_MANY_REQUESTS {
+                snapshot["retryAfterUntilUnixSecs"]
                     .as_u64()
-                    .unwrap_or_else(|| now.saturating_add(BLOCK_WITHOUT_RESET_HEADER_SECS)),
-            );
+                    .or_else(|| snapshot["blockedUntilUnixSecs"].as_u64())
+                    .or_else(|| Some(revision / 1_000_000 + BLOCK_WITHOUT_RESET_HEADER_SECS))
+            } else {
+                None
+            };
+            state.block_status_at_micros = Some(revision);
+            changed = true;
+        }
+        if state
+            .last_response_at_micros
+            .is_none_or(|last| revision > last)
+        {
+            state.last_response_at = Some(revision / 1_000_000);
+            state.last_response_at_micros = Some(revision);
+            state.last_response_status = Some(status.as_u16());
+            changed = true;
+        }
+        state.recompute_block(self.threshold);
+        changed
+    }
+
+    pub(super) fn update_threshold(&mut self, threshold: f64) -> bool {
+        if self.threshold == threshold {
+            return false;
+        }
+        self.threshold = threshold;
+        for state in &mut self.accounts {
+            state.recompute_block(threshold);
         }
         true
     }
@@ -383,6 +431,24 @@ impl AccountPool {
         now: u64,
     ) {
         let state = &mut self.accounts[selection.index];
+        let saved_retry = previous["retryAfterUntilUnixSecs"].as_u64().or_else(|| {
+            (previous["lastResponseStatus"].as_u64() == Some(429))
+                .then(|| previous["blockedUntilUnixSecs"].as_u64())
+                .flatten()
+        });
+        if let Some(until) = saved_retry.filter(|until| *until > now) {
+            state.block_retry_until(until);
+        }
+        if let Some(revision) = previous["blockStatusAtUnixMicros"]
+            .as_u64()
+            .or_else(|| previous["lastResponseAtUnixMicros"].as_u64())
+        {
+            state.block_status_at_micros = Some(
+                state
+                    .block_status_at_micros
+                    .map_or(revision, |old| old.max(revision)),
+            );
+        }
         for window in WATCHED_WINDOWS {
             if state.windows.contains_key(window) {
                 continue;
@@ -398,14 +464,17 @@ impl AccountPool {
                 continue;
             };
             let reset_at_unix_secs = usage["resetAtUnixSecs"].as_u64();
-            if utilization >= self.threshold && reset_at_unix_secs.is_none_or(|reset| reset > now) {
-                state.block_until(reset_at_unix_secs.unwrap_or_else(|| {
+            if utilization >= self.threshold && reset_at_unix_secs.is_none() {
+                state.block_retry_until(
                     previous["blockedUntilUnixSecs"]
                         .as_u64()
                         .filter(|until| *until > now)
-                        .unwrap_or_else(|| now.saturating_add(BLOCK_WITHOUT_RESET_HEADER_SECS))
-                }));
+                        .unwrap_or_else(|| now.saturating_add(BLOCK_WITHOUT_RESET_HEADER_SECS)),
+                );
             }
+            state
+                .window_versions
+                .insert(window, window_revision(previous, window));
             state.windows.insert(
                 window,
                 ObservedWindow {
@@ -418,6 +487,7 @@ impl AccountPool {
                 },
             );
         }
+        state.recompute_block(self.threshold);
     }
 
     pub(super) fn count_fields(&self, now: u64) -> serde_json::Map<String, Value> {
@@ -583,6 +653,129 @@ mod tests {
                 .account
                 .name,
             "first"
+        );
+    }
+
+    #[test]
+    fn healthy_fable_account_remains_selectable_after_a_rate_limit() {
+        let mut pool = pool_of(&["first", "second"], None);
+        let first = pool.observation_targets()[0].clone();
+        let second = pool.observation_targets()[1].clone();
+        pool.observe(
+            &first,
+            StatusCode::OK,
+            &usage(FABLE_WEEKLY_WINDOW, 1.0, Some(LATE_RECOVERY_UNIX_SECS)),
+            NOW_UNIX_SECS,
+        );
+        pool.observe(
+            &second,
+            StatusCode::TOO_MANY_REQUESTS,
+            &usage(FABLE_WEEKLY_WINDOW, 1.0, Some(EARLY_RECOVERY_UNIX_SECS)),
+            NOW_UNIX_SECS,
+        );
+        // A later successful response explicitly confirms allowance on first.
+        pool.observe(
+            &first,
+            StatusCode::OK,
+            &usage(FABLE_WEEKLY_WINDOW, 0.26, Some(LATE_RECOVERY_UNIX_SECS)),
+            NOW_UNIX_SECS + 1,
+        );
+        assert_eq!(
+            pool.usage_snapshot(&first, NOW_UNIX_SECS + 1)["windows"]["7d_oi"]["utilization"],
+            0.26
+        );
+        let next = pool.select(NOW_UNIX_SECS + 1, &["second".into()]);
+        assert_eq!(
+            next.map(|s| s.account.name),
+            Some("first".into()),
+            "a healthy first account must remain selectable after second returns 429"
+        );
+    }
+
+    #[test]
+    fn weekly_only_response_does_not_discard_a_pending_fable_refresh() {
+        let mut running = pool_of(&["first", "second"], None);
+        let first = running.observation_targets()[0].clone();
+        running.observe(
+            &first,
+            StatusCode::OK,
+            &usage(FABLE_WEEKLY_WINDOW, 1.0, Some(LATE_RECOVERY_UNIX_SECS)),
+            NOW_UNIX_SECS,
+        );
+        running.accounts[0].last_response_at_micros = Some(1_000_001);
+        let mut cli = pool_of(&["first"], None);
+        let selected = cli.observation_targets()[0].clone();
+        cli.observe(
+            &selected,
+            StatusCode::OK,
+            &usage(FABLE_WEEKLY_WINDOW, 0.26, Some(LATE_RECOVERY_UNIX_SECS)),
+            NOW_UNIX_SECS + 1,
+        );
+        let mut refreshed = cli.usage_snapshot(&selected, NOW_UNIX_SECS + 1);
+        refreshed["lastResponseAtUnixMicros"] = json!(1_000_002);
+        // Before importing it, a later response updates 7d only, not Fable.
+        running.observe(
+            &first,
+            StatusCode::OK,
+            &usage(WEEKLY_WINDOW, 0.23, Some(LATE_RECOVERY_UNIX_SECS)),
+            NOW_UNIX_SECS + 2,
+        );
+        running.accounts[0].last_response_at_micros = Some(1_000_003);
+        running.apply_usage_refresh(&refreshed, NOW_UNIX_SECS + 2);
+        assert_eq!(
+            running.usage_snapshot(&first, NOW_UNIX_SECS + 2)["windows"]["7d_oi"]["utilization"],
+            0.26,
+            "a weekly-only observation must not discard the newer Fable observation"
+        );
+    }
+
+    #[test]
+    fn failed_startup_keeps_saved_retry_deadline_without_windows() {
+        let mut pool = pool_of(&["first", "second"], None);
+        let first = pool.observation_targets()[0].clone();
+        let previous = json!({"account":"first","lastResponseStatus":429,"eligible":false,
+            "blockedUntilUnixSecs":LATE_RECOVERY_UNIX_SECS,"windows":{}});
+        pool.preserve_unobserved_windows(&first, &previous, NOW_UNIX_SECS);
+        assert_eq!(
+            pool.usage_snapshot(&first, NOW_UNIX_SECS)["eligible"],
+            false,
+            "a failed startup probe must not erase an unexpired retry deadline"
+        );
+    }
+
+    #[test]
+    fn changed_threshold_recomputes_usage_but_keeps_retry_after() {
+        let mut pool = pool_of(&["first", "second"], None);
+        let first = pool.observation_targets()[0].clone();
+        pool.observe(
+            &first,
+            StatusCode::OK,
+            &usage(FABLE_WEEKLY_WINDOW, 0.96, Some(LATE_RECOVERY_UNIX_SECS)),
+            NOW_UNIX_SECS,
+        );
+        assert_eq!(
+            pool.usage_snapshot(&first, NOW_UNIX_SECS)["eligible"],
+            false
+        );
+        assert!(pool.update_threshold(0.98));
+        assert_eq!(pool.usage_snapshot(&first, NOW_UNIX_SECS)["eligible"], true);
+        pool.observe(
+            &first,
+            StatusCode::TOO_MANY_REQUESTS,
+            &RateLimitObservation {
+                retry_after_secs: Some(RETRY_AFTER_SECS),
+                ..Default::default()
+            },
+            NOW_UNIX_SECS,
+        );
+        assert!(pool.update_threshold(0.99));
+        assert_eq!(
+            pool.usage_snapshot(&first, NOW_UNIX_SECS)["eligible"],
+            false
+        );
+        assert_eq!(
+            pool.usage_snapshot(&first, NOW_UNIX_SECS)["retryAfterUntilUnixSecs"],
+            NOW_UNIX_SECS + RETRY_AFTER_SECS
         );
     }
 

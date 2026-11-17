@@ -155,6 +155,13 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             expires,
             account_id,
         };
+        // A login or logout may have completed while the OAuth request was in
+        // flight. Its durable result takes precedence over this old session.
+        match self.store.load_auth()? {
+            Some(latest) if latest != *current => return Ok(latest),
+            None => anyhow::bail!("Authentication was cleared during token refresh; sign in again"),
+            Some(_) => {}
+        }
         self.store.save_auth(next.clone())?;
         Ok(next)
     }
@@ -193,6 +200,74 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
+
+    async fn refresh_after_external_change(logout: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backing = InMemoryAuthStore::new();
+        backing
+            .save(StoredAuth {
+                access: "old-access".into(),
+                refresh: "old-refresh".into(),
+                expires: 0,
+                account_id: Some("old-account".into()),
+            })
+            .unwrap();
+        let other_process = backing.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            if logout {
+                other_process.clear().unwrap();
+            } else {
+                other_process
+                    .save(StoredAuth {
+                        access: "new-login-access".into(),
+                        refresh: "new-login-refresh".into(),
+                        expires: u64::MAX,
+                        account_id: Some("new-account".into()),
+                    })
+                    .unwrap();
+            }
+            let body=br#"{"access_token":"refreshed-old-access","refresh_token":"refreshed-old-refresh","expires_in":3600}"#;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let manager = CodexAuthManager::new_with_token_endpoint(
+            CodexTokenStore::new(backing),
+            format!("http://{addr}/oauth/token"),
+        );
+        let _response = manager.get_auth().await;
+        server.join().unwrap();
+        let persisted = manager.store.load_auth().unwrap();
+        if logout {
+            assert!(
+                persisted.is_none(),
+                "an in-flight refresh must not recreate credentials deleted by logout"
+            );
+        } else {
+            assert_eq!(
+                persisted.map(|auth| auth.account_id),
+                Some(Some("new-account".into())),
+                "an in-flight refresh must not overwrite a newer login from another process"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_preserves_external_login() {
+        refresh_after_external_change(false).await;
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_does_not_restore_logged_out_credentials() {
+        refresh_after_external_change(true).await;
+    }
 
     fn test_store() -> CodexTokenStore<InMemoryAuthStore<StoredAuth>> {
         CodexTokenStore::new(InMemoryAuthStore::new())

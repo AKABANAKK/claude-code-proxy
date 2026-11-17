@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
-use super::ratelimit::WindowUsage;
+use super::ratelimit::{WATCHED_WINDOWS, WindowUsage};
 
 #[derive(Debug)]
 pub(super) struct ObservedWindow {
@@ -59,6 +59,49 @@ pub(super) fn now_unix_micros() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+pub(super) fn window_revision(snapshot: &Value, window: &str) -> u64 {
+    snapshot["windowUpdatedAtUnixMicros"][window]
+        .as_u64()
+        .or_else(|| {
+            snapshot["windows"][window]["observedAtUnixSecs"]
+                .as_u64()
+                .map(|secs| secs.saturating_mul(1_000_000))
+        })
+        .or_else(|| {
+            snapshot["lastResponseStatus"]
+                .as_u64()
+                .filter(|status| (200..300).contains(status))?;
+            snapshot["lastResponseAtUnixMicros"].as_u64()
+        })
+        .unwrap_or(0)
+}
+
+fn merge_refresh(previous: &Value, next: &Value) -> Value {
+    let previous_time = previous["lastResponseAtUnixMicros"].as_u64().unwrap_or(0);
+    let next_time = next["lastResponseAtUnixMicros"].as_u64().unwrap_or(0);
+    let mut merged = if next_time >= previous_time {
+        next.clone()
+    } else {
+        previous.clone()
+    };
+    merged["windows"] = json!({});
+    merged["windowUpdatedAtUnixMicros"] = json!({});
+    for window in WATCHED_WINDOWS {
+        let old = window_revision(previous, window);
+        let new = window_revision(next, window);
+        let (source, revision) = if new >= old {
+            (next, new)
+        } else {
+            (previous, old)
+        };
+        merged["windows"][window] = source["windows"][window].clone();
+        if revision > 0 {
+            merged["windowUpdatedAtUnixMicros"][window] = json!(revision);
+        }
+    }
+    merged
+}
+
 pub(super) struct UsageFiles {
     directory: PathBuf,
     writer: OnceLock<io::Result<UsageWriter>>,
@@ -96,17 +139,55 @@ impl UsageFiles {
         write_snapshot(&self.directory, account, snapshot)
     }
 
-    pub fn refresh_path(&self) -> PathBuf {
-        self.directory.join(".refresh").join("latest.json")
+    pub fn refresh_path(&self, account: &str) -> PathBuf {
+        self.directory
+            .join(".refresh")
+            .join("accounts")
+            .join(filename(account))
     }
 
     /// Separate from runtime snapshots so queued writes cannot erase CLI updates.
     pub fn publish_refresh(&self, snapshots: &[Value]) -> anyhow::Result<()> {
-        write_snapshot(
-            &self.directory.join(".refresh"),
-            "latest",
-            &json!({"accounts": snapshots}),
-        )
+        let directory = self.directory.join(".refresh");
+        std::fs::create_dir_all(&directory)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let publication_lock = options.open(directory.join("publish.lock"))?;
+        publication_lock.lock()?;
+        let mut failure = None;
+        for snapshot in snapshots {
+            let result = (|| -> anyhow::Result<()> {
+                let account = snapshot["account"]
+                    .as_str()
+                    .context("Missing account in usage refresh")?;
+                let previous = match std::fs::read(self.refresh_path(account)) {
+                    Ok(raw) => Some(serde_json::from_slice::<Value>(&raw)?),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+                    Err(err) => return Err(err.into()),
+                };
+                let merged = previous
+                    .as_ref()
+                    .map(|previous| merge_refresh(previous, snapshot));
+                write_snapshot(
+                    &self.directory.join(".refresh").join("accounts"),
+                    account,
+                    merged.as_ref().unwrap_or(snapshot),
+                )?;
+                Ok(())
+            })();
+            if let Err(err) = result {
+                failure.get_or_insert(err);
+            }
+        }
+        match failure {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// Call while holding the pool lock to preserve observation order. Only the
@@ -329,6 +410,49 @@ fn filename(account: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_publication_retains_a_newer_window_and_confirmed_absence() {
+        for fable in [
+            json!({"utilization":0.26,"observedAtUnixSecs":1}),
+            Value::Null,
+        ] {
+            let directory = tempfile::TempDir::new().unwrap();
+            let files = UsageFiles::new(directory.path().to_path_buf());
+            files
+                .publish_refresh(&[json!({"account":"first","lastResponseStatus":200,
+                "lastResponseAtUnixMicros":20,"windowUpdatedAtUnixMicros":{"7d_oi":20},
+                "windows":{"7d_oi":fable}})])
+                .unwrap();
+            files
+                .publish_refresh(&[json!({"account":"first","lastResponseStatus":429,
+                "lastResponseAtUnixMicros":30,"windowUpdatedAtUnixMicros":{"7d_oi":10,"7d":30},
+                "windows":{"7d":{"utilization":0.23,"observedAtUnixSecs":1},
+                    "7d_oi":{"utilization":1.0,"observedAtUnixSecs":1}}})])
+                .unwrap();
+            let saved: Value =
+                serde_json::from_slice(&std::fs::read(files.refresh_path("first")).unwrap())
+                    .unwrap();
+            assert_eq!(saved["lastResponseStatus"], 429);
+            assert_eq!(saved["windows"]["7d_oi"], fable);
+            assert_eq!(window_revision(&saved, "7d_oi"), 20);
+        }
+    }
+
+    #[test]
+    fn a_failed_publication_does_not_discard_other_accounts() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let files = UsageFiles::new(directory.path().to_path_buf());
+        std::fs::create_dir_all(files.refresh_path("first")).unwrap();
+        assert!(
+            files
+                .publish_refresh(&[json!({"account":"first"}), json!({"account":"second"})])
+                .is_err()
+        );
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(files.refresh_path("second")).unwrap()).unwrap();
+        assert_eq!(saved["account"], "second");
+    }
 
     #[test]
     fn read_uses_the_encoded_filename_without_starting_a_writer() {

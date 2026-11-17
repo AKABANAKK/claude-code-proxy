@@ -1,5 +1,6 @@
 //! Account selection, bounded retries, and usage logging around an upstream request.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -21,10 +22,38 @@ const USAGE_PROBE_MODEL: &str = "claude-fable-5-1";
 const USAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) const USAGE_PROBE_CONCURRENCY: usize = 3;
 
+#[derive(PartialEq, Eq)]
+struct RefreshStamp {
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+impl RefreshStamp {
+    fn new(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            len: metadata.len(),
+            #[cfg(unix)]
+            identity: (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            ),
+        }
+    }
+}
+
 pub(super) struct AccountRelay {
     pool: Option<Mutex<AccountPool>>,
     usage_files: Option<UsageFiles>,
-    last_refresh: tokio::sync::Mutex<Option<(SystemTime, u64)>>,
+    last_refresh: tokio::sync::Mutex<BTreeMap<String, RefreshStamp>>,
 }
 
 impl AccountRelay {
@@ -39,7 +68,7 @@ impl AccountRelay {
         Self {
             pool: pool.map(Mutex::new),
             usage_files: None,
-            last_refresh: tokio::sync::Mutex::new(None),
+            last_refresh: tokio::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -198,35 +227,59 @@ impl AccountRelay {
         let Some(files) = &self.usage_files else {
             return Ok(());
         };
-        // Serialize refresh imports, but never hold the account pool during I/O.
         let mut previous = self.last_refresh.lock().await;
-        let path = files.refresh_path();
-        let metadata = match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(err.into()),
-        };
-        let stamp = (metadata.modified()?, metadata.len());
-        if previous.as_ref() == Some(&stamp) {
-            return Ok(());
+        let names: Vec<_> = lock_pool(pool).accounts().map(|a| a.name.clone()).collect();
+        let mut loaded = Vec::new();
+        // A bad or missing account file must not prevent other accounts updating.
+        // The pool is never locked during metadata reads or JSON parsing.
+        for name in names {
+            let result: anyhow::Result<Option<_>> = async {
+                let path = files.refresh_path(&name);
+                let metadata = match tokio::fs::metadata(&path).await {
+                    Ok(metadata) => metadata,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(err) => return Err(err.into()),
+                };
+                let stamp = RefreshStamp::new(&metadata);
+                if previous.get(&name) == Some(&stamp) {
+                    return Ok(None);
+                }
+                let snapshot: Value = serde_json::from_slice(&tokio::fs::read(path).await?)?;
+                anyhow::ensure!(
+                    snapshot["account"].as_str() == Some(name.as_str()),
+                    "Account does not match usage refresh"
+                );
+                Ok(Some((stamp, snapshot)))
+            }
+            .await;
+            match result {
+                Ok(Some((stamp, snapshot))) => loaded.push((name, stamp, snapshot)),
+                Ok(None) => {}
+                Err(err) => log.warn(
+                    "anthropic_accounts_usage_reload_failed",
+                    Some(serde_json::Map::from_iter([
+                        ("reqId".into(), serde_json::json!(req_id)),
+                        ("account".into(), serde_json::json!(name)),
+                        ("error".into(), serde_json::json!(err.to_string())),
+                    ])),
+                ),
+            }
         }
-        let refresh: Value = serde_json::from_slice(&tokio::fs::read(path).await?)?;
-        let snapshots = refresh["accounts"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("Invalid account usage refresh"))?;
         let (updated, mut fields) = {
             let mut pool = lock_pool(pool);
             let now = now_unix_secs();
-            let updated = snapshots
+            let updated = loaded
                 .iter()
-                .filter(|snapshot| pool.apply_usage_refresh(snapshot, now))
+                .filter(|(_, _, snapshot)| pool.apply_usage_refresh(snapshot, now))
                 .count();
             if updated > 0 {
                 self.save_all_usage(&pool, now);
             }
             (updated, pool.count_fields(now))
         };
-        *previous = Some(stamp);
+        for (name, stamp, _) in loaded {
+            previous.insert(name, stamp);
+        }
         if updated > 0 {
             fields.insert("reqId".into(), serde_json::json!(req_id));
             fields.insert("updatedAccountCount".into(), serde_json::json!(updated));
@@ -247,6 +300,12 @@ impl AccountRelay {
             return send_upstream(&client, request, req_id, None, traffic).await;
         };
         let log = create_logger("anthropic");
+        {
+            let mut pool = lock_pool(pool);
+            if pool.update_threshold(crate::config::anthropic_switch_threshold()) {
+                self.save_all_usage(&pool, now_unix_secs());
+            }
+        }
         let mut tried_accounts = Vec::new();
         let mut rejected = None;
         self.sync_usage_refresh(pool, &log, req_id).await;
@@ -655,6 +714,70 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn partial_second_update_keeps_unconsumed_recovery() {
+        use super::super::ratelimit::{FABLE_WEEKLY_WINDOW, RateLimitObservation, WindowUsage};
+        let directory = tempfile::TempDir::new().unwrap();
+        let make_pool = || {
+            AccountPool::new(
+                ["first", "second"]
+                    .into_iter()
+                    .map(|name| PoolAccount {
+                        name: name.into(),
+                        token: format!("synthetic-{name}"),
+                    })
+                    .collect(),
+                0.98,
+                None,
+            )
+        };
+        let observation = |utilization| RateLimitObservation {
+            windows: vec![WindowUsage {
+                window: FABLE_WEEKLY_WINDOW,
+                utilization,
+                reset_at_unix_secs: Some(4102444800),
+            }],
+            retry_after_secs: None,
+        };
+        let now = now_unix_secs();
+        let mut running = make_pool();
+        let selections = running.observation_targets();
+        for selection in &selections {
+            running.observe(selection, StatusCode::OK, &observation(1.0), now);
+        }
+        let files = UsageFiles::new(directory.path().to_path_buf());
+        let mut cli = make_pool();
+        let targets = cli.observation_targets();
+        cli.observe(&targets[1], StatusCode::OK, &observation(0.26), now);
+        let recovered = cli.usage_snapshot(&targets[1], now);
+        files.save("second", &recovered).unwrap();
+        files.publish_refresh(&[recovered]).unwrap();
+        // A repeated CLI update succeeds only for first; second has a transport
+        // error, so production publishes only first in this newer batch.
+        cli.observe(
+            &targets[0],
+            StatusCode::TOO_MANY_REQUESTS,
+            &observation(1.0),
+            now,
+        );
+        let limited = cli.usage_snapshot(&targets[0], now);
+        files.save("first", &limited).unwrap();
+        files.publish_refresh(&[limited]).unwrap();
+        assert_eq!(files.read("second").unwrap().unwrap()["eligible"], true);
+        let relay =
+            AccountRelay::with_usage_directory(Some(running), directory.path().to_path_buf());
+        let pool = relay.pool.as_ref().unwrap();
+        relay
+            .load_usage_refresh(pool, &create_logger("anthropic"), "audit-partial-update")
+            .await
+            .unwrap();
+        let snapshot = lock_pool(pool).usage_snapshot(&selections[1], now);
+        assert_eq!(
+            snapshot["eligible"], true,
+            "the second update must not discard the earlier successful recovery of second"
+        );
+    }
+
+    #[tokio::test]
     async fn upstream_connection_failure_reports_os_cause_without_secrets() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -760,7 +883,7 @@ mod tests {
                 None,
             ))),
             usage_files: Some(files),
-            last_refresh: tokio::sync::Mutex::new(None),
+            last_refresh: tokio::sync::Mutex::new(BTreeMap::new()),
         };
         let release = ReleaseWriterOnDrop(release);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
