@@ -147,8 +147,8 @@ responses also update authentication or block status. A 429 with usage headers
 counts as a successful usage update. Partial failures are reported per account
 and make the command exit with status 1 after displaying the results. An empty
 registry exits successfully without making requests. Updates preserve the last
-observed selection. Running proxies import updates before selecting the next
-account, without a restart. Each account retains its last successful publication
+observed selection. Running proxies import updates while idle, once per second,
+and before every account attempt, without a restart. Each account retains its last successful publication
 when a later update partially fails.
 
 Keep Claude Code logged in normally. Registered tokens replace the forwarded

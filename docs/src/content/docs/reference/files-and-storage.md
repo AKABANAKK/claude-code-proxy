@@ -105,9 +105,11 @@ failures and partial refresh failures cause a nonzero exit.
 
 Explicit updates are also published atomically to
 `<state-root>/anthropic/accounts/.refresh/accounts/<account>.json`, separately from the
-background snapshot writer. Before selecting an account for a request, running
-proxies import newer observations and recompute eligibility, releasing cached
-blocks when a successful probe confirms fresh allowance. Unchanged update files
+background snapshot writer. A running proxy imports newer observations once per
+second even without client traffic, and again before every upstream attempt,
+including account failover after a 429. The local watcher makes no upstream
+requests and stops with the service. Fresh allowance recomputes eligibility and
+releases cached blocks without a restart. Unchanged update files
 are not parsed again. The pool lock is not held during file I/O, and a failed
 import leaves the current pool intact. The `anthropic_accounts_usage_reloaded`
 event records imported updates. Restarting is not required for usage updates;
