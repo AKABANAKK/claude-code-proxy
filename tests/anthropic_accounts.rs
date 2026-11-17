@@ -1131,6 +1131,27 @@ async fn update_releases_cached_blocks_in_a_running_proxy_without_restart() {
         "{}",
         String::from_utf8_lossy(&updated.stderr)
     );
+    // The update must reach the idle server before sending another request.
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let log = std::fs::read_to_string(config.path().join("claude-code-proxy/proxy.log"))
+                .unwrap_or_default();
+            if log
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|row| {
+                    row["msg"] == "anthropic_accounts_usage_reloaded"
+                        && row["fields"]["reqId"] == "usage-watcher"
+                        && row["fields"]["eligibleAccountCount"] == 1
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("accounts update must be applied without another client request");
     let after = request().send().await.unwrap();
     let status = after.status();
     after.bytes().await.unwrap();

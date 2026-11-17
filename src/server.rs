@@ -164,6 +164,7 @@ pub async fn serve_listener(
     create_logger("server").info(
         "server listening",
         Some(serde_json::Map::from_iter([
+            ("version".to_string(), json!(env!("CARGO_PKG_VERSION"))),
             ("port".to_string(), json!(port)),
             (
                 "bindAddress".to_string(),

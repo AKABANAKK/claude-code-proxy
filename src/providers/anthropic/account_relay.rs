@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderValue, StatusCode, header::AUTHORIZATION};
@@ -51,9 +51,10 @@ impl RefreshStamp {
 }
 
 pub(super) struct AccountRelay {
-    pool: Option<Mutex<AccountPool>>,
-    usage_files: Option<UsageFiles>,
-    last_refresh: tokio::sync::Mutex<BTreeMap<String, RefreshStamp>>,
+    pool: Option<Arc<Mutex<AccountPool>>>,
+    usage_files: Option<Arc<UsageFiles>>,
+    last_refresh: Arc<tokio::sync::Mutex<BTreeMap<String, RefreshStamp>>>,
+    refresh_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl AccountRelay {
@@ -66,15 +67,16 @@ impl AccountRelay {
 
     pub(super) fn with_pool(pool: Option<AccountPool>) -> Self {
         Self {
-            pool: pool.map(Mutex::new),
+            pool: pool.map(|pool| Arc::new(Mutex::new(pool))),
             usage_files: None,
-            last_refresh: tokio::sync::Mutex::new(BTreeMap::new()),
+            last_refresh: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            refresh_task: Mutex::new(None),
         }
     }
 
     pub(super) fn with_usage_directory(pool: Option<AccountPool>, directory: PathBuf) -> Self {
         let mut relay = Self::with_pool(pool);
-        relay.usage_files = Some(UsageFiles::new(directory));
+        relay.usage_files = Some(Arc::new(UsageFiles::new(directory)));
         // Read-only CLI commands construct providers too. Snapshot writes must
         // be triggered explicitly by startup, relayed traffic, or accounts update.
         relay
@@ -192,6 +194,39 @@ impl AccountRelay {
         let mut fields = lock_pool(pool).count_fields(now_unix_secs());
         fields.insert("failedAccountCount".into(), serde_json::json!(failures));
         log.info("anthropic_accounts_refresh_completed", Some(fields));
+        self.start_usage_watcher();
+    }
+
+    fn start_usage_watcher(&self) {
+        if self.pool.is_none() || self.usage_files.is_none() {
+            return;
+        }
+        let mut task = self
+            .refresh_task
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if task.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let observer = Self {
+            pool: self.pool.clone(),
+            usage_files: self.usage_files.clone(),
+            last_refresh: self.last_refresh.clone(),
+            refresh_task: Mutex::new(None),
+        };
+        *task = Some(tokio::spawn(async move {
+            let log = create_logger("anthropic");
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Some(pool) = &observer.pool {
+                    observer
+                        .sync_usage_refresh(pool, &log, "usage-watcher")
+                        .await;
+                }
+            }
+        }));
     }
 
     fn save_all_usage(&self, pool: &AccountPool, now: u64) {
@@ -308,8 +343,11 @@ impl AccountRelay {
         }
         let mut tried_accounts = Vec::new();
         let mut rejected = None;
-        self.sync_usage_refresh(pool, &log, req_id).await;
-        while let Some(selection) = select_account(pool, &tried_accounts) {
+        loop {
+            self.sync_usage_refresh(pool, &log, req_id).await;
+            let Some(selection) = select_account(pool, &tried_accounts) else {
+                break;
+            };
             let Some(mut attempt) = request.try_clone() else {
                 return Err(json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -376,6 +414,19 @@ impl AccountRelay {
         match rejected {
             Some(upstream) => Ok(upstream),
             None => send_upstream(&client, request, req_id, None, traffic).await,
+        }
+    }
+}
+
+impl Drop for AccountRelay {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .refresh_task
+            .get_mut()
+            .unwrap_or_else(|err| err.into_inner())
+            .take()
+        {
+            task.abort();
         }
     }
 }
@@ -713,6 +764,162 @@ fn log_pool_events(
 mod tests {
     use super::*;
 
+    fn live_update_pool() -> AccountPool {
+        use super::super::ratelimit::{FABLE_WEEKLY_WINDOW, RateLimitObservation, WindowUsage};
+        let mut pool = AccountPool::new(
+            ["first", "second"]
+                .into_iter()
+                .map(|name| PoolAccount {
+                    name: name.into(),
+                    token: format!("synthetic-{name}"),
+                })
+                .collect(),
+            0.98,
+            None,
+        );
+        for selection in pool.observation_targets() {
+            pool.observe(
+                &selection,
+                StatusCode::OK,
+                &RateLimitObservation {
+                    windows: vec![WindowUsage {
+                        window: FABLE_WEEKLY_WINDOW,
+                        utilization: 1.0,
+                        reset_at_unix_secs: Some(4102444800),
+                    }],
+                    retry_after_secs: None,
+                },
+                now_unix_secs(),
+            );
+        }
+        pool
+    }
+
+    fn recovered_second_snapshot() -> Value {
+        use super::super::ratelimit::{FABLE_WEEKLY_WINDOW, RateLimitObservation, WindowUsage};
+        let mut pool = live_update_pool();
+        let second = pool.observation_targets()[1].clone();
+        pool.observe(
+            &second,
+            StatusCode::OK,
+            &RateLimitObservation {
+                windows: vec![WindowUsage {
+                    window: FABLE_WEEKLY_WINDOW,
+                    utilization: 0.26,
+                    reset_at_unix_secs: Some(4102444800),
+                }],
+                retry_after_secs: None,
+            },
+            now_unix_secs(),
+        );
+        pool.usage_snapshot(&second, now_unix_secs())
+    }
+
+    #[tokio::test]
+    async fn explicit_update_reaches_idle_pool_without_another_request() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let relay = AccountRelay::with_usage_directory(
+            Some(live_update_pool()),
+            directory.path().to_path_buf(),
+        );
+        relay.initialize("://invalid").await;
+        UsageFiles::new(directory.path().to_path_buf())
+            .publish_refresh(&[recovered_second_snapshot()])
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let ready = {
+                    let pool = lock_pool(relay.pool.as_ref().unwrap());
+                    let second = pool.observation_targets()[1].clone();
+                    pool.usage_snapshot(&second, now_unix_secs())["eligible"] == true
+                };
+                if ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("accounts update must reach an idle running pool without a restart or request");
+    }
+
+    #[tokio::test]
+    async fn usage_watcher_stops_when_relay_is_dropped() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let relay = AccountRelay::with_usage_directory(
+            Some(live_update_pool()),
+            directory.path().to_path_buf(),
+        );
+        let pool = Arc::downgrade(relay.pool.as_ref().unwrap());
+        relay.start_usage_watcher();
+        drop(relay);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the refresh watcher must release state when its service stops");
+    }
+
+    #[tokio::test]
+    async fn explicit_update_during_request_is_applied_before_429_failover() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = tempfile::TempDir::new().unwrap();
+        let relay = AccountRelay::with_usage_directory(
+            Some(live_update_pool()),
+            directory.path().to_path_buf(),
+        );
+        let updated = recovered_second_snapshot();
+        let path = directory.path().to_path_buf();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let mock = tokio::spawn(async move {
+            for name in ["first", "second"] {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let mut headers = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !headers.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let n = connection.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    headers.extend_from_slice(&chunk[..n]);
+                }
+                assert!(
+                    String::from_utf8_lossy(&headers).contains(&format!("Bearer synthetic-{name}"))
+                );
+                if name == "first" {
+                    UsageFiles::new(path.clone())
+                        .publish_refresh(std::slice::from_ref(&updated))
+                        .unwrap();
+                    connection.write_all(b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 30\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}").await.unwrap();
+                } else {
+                    connection
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            relay.send(reqwest::Client::new().get(url), "live-failover", None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an update arriving in flight must unblock failover within the same request"
+        );
+        tokio::time::timeout(Duration::from_secs(3), mock)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn partial_second_update_keeps_unconsumed_recovery() {
         use super::super::ratelimit::{FABLE_WEEKLY_WINDOW, RateLimitObservation, WindowUsage};
@@ -871,7 +1078,7 @@ mod tests {
             )
         });
         let relay = AccountRelay {
-            pool: Some(Mutex::new(AccountPool::new(
+            pool: Some(Arc::new(Mutex::new(AccountPool::new(
                 ["test-first", "test-second"]
                     .into_iter()
                     .map(|name| PoolAccount {
@@ -881,9 +1088,10 @@ mod tests {
                     .collect(),
                 0.98,
                 None,
-            ))),
-            usage_files: Some(files),
-            last_refresh: tokio::sync::Mutex::new(BTreeMap::new()),
+            )))),
+            usage_files: Some(Arc::new(files)),
+            last_refresh: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            refresh_task: Mutex::new(None),
         };
         let release = ReleaseWriterOnDrop(release);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

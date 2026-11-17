@@ -182,9 +182,11 @@ pending saves. See
 [Files and storage](docs/src/content/docs/reference/files-and-storage.md)
 for snapshot freshness, refresh logs, and field details.
 
-`anthropic accounts update` also updates the running proxy before its next
-request. Fresh observations can release cached blocks without restarting the
-proxy. Updates are retained per account, and each quota window has its own
+`anthropic accounts update` also updates the running proxy while it is idle.
+A local watcher imports saved observations once per second without upstream
+requests. Updates are also checked before each request attempt, including 429
+failover, so an update arriving during a request can unblock its next account.
+Fresh observations release cached blocks without restarting the proxy. Updates are retained per account, and each quota window has its own
 observation order so unrelated responses cannot discard pending Fable updates.
 Changing `anthropic.switchThreshold` in the configuration file also takes effect
 before the next Claude request, while an existing 429 retry deadline is retained.
