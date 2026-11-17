@@ -184,7 +184,10 @@ for snapshot freshness, refresh logs, and field details.
 
 `anthropic accounts update` also updates the running proxy before its next
 request. Fresh observations can release cached blocks without restarting the
-proxy; older observations cannot overwrite a newer upstream response.
+proxy. Updates are retained per account, and each quota window has its own
+observation order so unrelated responses cannot discard pending Fable updates.
+Changing `anthropic.switchThreshold` in the configuration file also takes effect
+before the next Claude request, while an existing 429 retry deadline is retained.
 
 Switching accounts
 can lose prompt-cache reuse and increase usage on the next request. With no

@@ -104,7 +104,7 @@ server errors, and responses without usage headers preserve the previous usage;
 failures and partial refresh failures cause a nonzero exit.
 
 Explicit updates are also published atomically to
-`<state-root>/anthropic/accounts/.refresh/latest.json`, separately from the
+`<state-root>/anthropic/accounts/.refresh/accounts/<account>.json`, separately from the
 background snapshot writer. Before selecting an account for a request, running
 proxies import newer observations and recompute eligibility, releasing cached
 blocks when a successful probe confirms fresh allowance. Unchanged update files
@@ -113,10 +113,14 @@ import leaves the current pool intact. The `anthropic_accounts_usage_reloaded`
 event records imported updates. Restarting is not required for usage updates;
 registration changes still require a restart.
 
-Observation times include microseconds so an older CLI response cannot replace
-a newer upstream rejection even when both arrive in the same second. Partial
-429 responses retain unobserved windows, and failed or empty probes do not
-release known limits.
+Explicit updates are retained independently for each account, including when a
+later update fails for that account. Publishers serialize writes and merge each
+window by its own microsecond revision. A newer 7d-only response does not discard
+a pending Fable observation, and confirmed absent windows cannot be resurrected
+by older updates. Authentication and 429 retry deadlines have separate ordering
+from quota windows. Failed startup probes preserve an unexpired saved retry
+deadline even when no quota headers were available. Partial 429 responses retain
+unobserved windows; failed or empty probes do not release known limits.
 
 | Field | Meaning |
 | --- | --- |
@@ -125,6 +129,9 @@ release known limits.
 | `asOf` / `asOfUnixSecs` | Snapshot time, as UTC RFC 3339 / Unix seconds. |
 | `lastResponseAt` / `lastResponseStatus` | Last upstream response observed for this account, or `null`. |
 | `lastResponseAtUnixMicros` | Ordering timestamp for response observations, used when importing explicit usage refreshes. |
+| `windowUpdatedAtUnixMicros` | Per-window revisions, including confirmed absence, used to merge quota observations. |
+| `blockStatusAtUnixMicros` | Ordering timestamp for authentication and retry status. |
+| `retryAfterUntilUnixSecs` | Saved 429 retry deadline, independent of usage-window resets. |
 | `switchThreshold` | Usage threshold used by the running proxy, normally `0.98`. |
 | `eligible` | Whether the local pool permits selection at `asOf`; this is not confirmation of remaining upstream allowance. |
 | `invalid` | Whether a 401 has invalidated the account in this process. |

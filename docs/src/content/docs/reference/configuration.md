@@ -193,11 +193,14 @@ registration order and wraps around. If every valid account is blocked, it
 tries the account with the earliest recovery time. HTTP 429 can trigger a retry
 with another account, with at most one attempt per account per request; when
 there is no further selection, the last 429 is returned. Other statuses are not
-retried. HTTP 401 removes that account from selection until the proxy restarts.
+retried. HTTP 401 removes that account from selection until a successful explicit
+usage refresh or a restart.
 If none remain valid, subsequent requests forward Claude Code's original login.
 
-Account settings and registrations are loaded at startup. Restart the proxy
-after changing them. Account selection and block state are held in memory;
+Registrations and the initial active account are loaded at startup; restart after
+changing them. File changes to `anthropic.switchThreshold` are applied before the
+next Claude request and recompute usage blocks. Changing the threshold does not
+cancel an existing HTTP 429 retry deadline. Account selection and block state are held in memory;
 `anthropic accounts list` shows registrations, not live usage or block state.
 Selection, blocking, invalidation, and retries are recorded in `proxy.log`.
 

@@ -140,13 +140,16 @@ removing an unknown name exit with status 2.
 the updated list in registration order. It uses the same one-token model request
 as the startup checks, with up to three requests in parallel and a ten-second
 timeout per account.
-Missing windows retain their previous observations. Connection failures, server
+Successful usage responses confirm absent windows; failed or partial rejected
+responses retain unobserved windows. Connection failures, server
 errors, and responses without usage headers keep the previous usage; 401 and 429
 responses also update authentication or block status. A 429 with usage headers
 counts as a successful usage update. Partial failures are reported per account
 and make the command exit with status 1 after displaying the results. An empty
 registry exits successfully without making requests. Updates preserve the last
-observed selection and do not change the in-memory pool of a running proxy.
+observed selection. Running proxies import updates before selecting the next
+account, without a restart. Each account retains its last successful publication
+when a later update partially fails.
 
 Keep Claude Code logged in normally. Registered tokens replace the forwarded
 `Authorization` header on the Claude route. The default switch threshold is

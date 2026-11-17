@@ -957,6 +957,52 @@ fn accounts_test_executable() -> std::ffi::OsString {
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_claude-code-proxy").into())
 }
 
+async fn start_account_test_proxy(
+    config: &TempDir,
+    base_url: &str,
+    threshold: Option<&str>,
+) -> (ProxyProcess, u64) {
+    use std::process::Stdio;
+    use std::time::Duration;
+    let mut command = std::process::Command::new(accounts_test_executable());
+    command
+        .args(["serve", "--no-monitor", "--port", "0"])
+        .env("CCP_CONFIG_DIR", config.path())
+        .env("XDG_STATE_HOME", config.path())
+        .env("LOCALAPPDATA", config.path())
+        .env("CCP_BIND_ADDRESS", "127.0.0.1")
+        .env("CCP_ANTHROPIC_BASE_URL", base_url)
+        .env_remove("CCP_ANTHROPIC_SWITCH_THRESHOLD")
+        .env("CCP_ANTHROPIC_ACTIVE_ACCOUNT", "first")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(threshold) = threshold {
+        command.env("CCP_ANTHROPIC_SWITCH_THRESHOLD", threshold);
+    }
+    let proxy = ProxyProcess(command.spawn().unwrap());
+    let port = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let log = std::fs::read_to_string(config.path().join("claude-code-proxy/proxy.log"))
+                .unwrap_or_default();
+            if let Some(port) = log
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|row| row["msg"] == "server listening")
+                .and_then(|row| row["fields"]["port"].as_u64())
+            {
+                break port;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("test proxy should finish its synthetic startup probes");
+    (proxy, port)
+}
+
 async fn update_against_mock(
     config: &TempDir,
     responses: &[(&str, Option<&str>)],
@@ -1012,7 +1058,6 @@ async fn update_against_mock(
 
 #[tokio::test]
 async fn update_releases_cached_blocks_in_a_running_proxy_without_restart() {
-    use std::process::Stdio;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
@@ -1055,41 +1100,7 @@ async fn update_releases_cached_blocks_in_a_running_proxy_without_restart() {
         }
         requests
     });
-    let _proxy = ProxyProcess(
-        std::process::Command::new(accounts_test_executable())
-            .args(["serve", "--no-monitor", "--port", "0"])
-            .env("CCP_CONFIG_DIR", config.path())
-            .env("XDG_STATE_HOME", config.path())
-            .env("LOCALAPPDATA", config.path())
-            .env("CCP_BIND_ADDRESS", "127.0.0.1")
-            .env("CCP_ANTHROPIC_BASE_URL", base_url)
-            .env("CCP_ANTHROPIC_SWITCH_THRESHOLD", "98")
-            .env("CCP_ANTHROPIC_ACTIVE_ACCOUNT", "first")
-            .env("NO_PROXY", "127.0.0.1,localhost")
-            .env("no_proxy", "127.0.0.1,localhost")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let port = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let log = std::fs::read_to_string(config.path().join("claude-code-proxy/proxy.log"))
-                .unwrap_or_default();
-            if let Some(port) = log
-                .lines()
-                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .find(|row| row["msg"] == "server listening")
-                .and_then(|row| row["fields"]["port"].as_u64())
-            {
-                break port;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("test proxy should finish its synthetic startup probes");
+    let (_proxy, port) = start_account_test_proxy(&config, &base_url, Some("98")).await;
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
@@ -1135,6 +1146,68 @@ async fn update_releases_cached_blocks_in_a_running_proxy_without_restart() {
         "the next request must use the recovered account without restarting the proxy"
     );
     assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn running_proxy_reloads_changed_switch_threshold_before_selection() {
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    const FIRST: &str = concat!(
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n",
+        "anthropic-ratelimit-unified-7d_oi-utilization: 0.85\r\n",
+        "anthropic-ratelimit-unified-7d_oi-reset: 4102444800\r\n\r\n{}"
+    );
+    let config = TempDir::new().unwrap();
+    register_probe_fixture(&config, &["first", "second"]);
+    let config_file = config.path().join("config.json");
+    std::fs::write(&config_file, r#"{"anthropic":{"switchThreshold":0.98}}"#).unwrap();
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", upstream.local_addr().unwrap());
+    let mock = tokio::spawn(async move {
+        let mut messages = Vec::new();
+        for _ in 0..5 {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let (headers, body) = read_probe_request(&mut stream).await;
+            let response = if headers.contains("Bearer test-token-first\r\n") {
+                FIRST
+            } else {
+                MOCK_UPDATED_USAGE
+            };
+            stream.write_all(response.as_bytes()).await.unwrap();
+            if body["max_tokens"] != 1 {
+                messages.push(headers);
+            }
+        }
+        messages
+    });
+    let (_proxy, port) = start_account_test_proxy(&config, &base_url, None).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let request = || {
+        client.post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .json(&serde_json::json!({"model":"claude-fable-5-2","max_tokens":16,"messages":[{"role":"user","content":"test"}]}))
+    };
+    request().send().await.unwrap().bytes().await.unwrap();
+    std::fs::write(&config_file, r#"{"anthropic":{"switchThreshold":0.80}}"#).unwrap();
+    request().send().await.unwrap().bytes().await.unwrap();
+    std::fs::write(&config_file, r#"{"anthropic":{"switchThreshold":0.98}}"#).unwrap();
+    request().send().await.unwrap().bytes().await.unwrap();
+    let messages = tokio::time::timeout(Duration::from_secs(5), mock)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(messages[0].contains("Bearer test-token-first\r\n"));
+    assert!(
+        messages[1].contains("Bearer test-token-second\r\n"),
+        "the lowered threshold must apply before selecting the next account"
+    );
+    assert!(
+        messages[2].contains("Bearer test-token-second\r\n"),
+        "a recovered account must not interrupt a usable active account"
+    );
 }
 
 #[tokio::test]
