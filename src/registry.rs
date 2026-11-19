@@ -2,12 +2,12 @@ use crate::{
     anthropic::{json_error, schema::MessagesRequest},
     config::AliasProvider,
     provider::{CliHandlers, Provider, RequestContext},
-    providers::codex::translate::model_allowlist::tier_model_variants,
+    providers::codex::translate::model_allowlist::{allowed_models, tier_model_variants},
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use axum::{http::StatusCode, response::Response};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
@@ -37,23 +37,6 @@ const CURSOR_LEGACY_MODELS: &[&str] = &[
     "cursor-ask",
     "composer-2.5",
     "composer-2.5-fast",
-];
-
-pub(crate) const CODEX_MODELS: &[&str] = &[
-    "gpt-5.2",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.5",
-    "gpt-5.6-luna",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-6-astra",
-    "gpt-6-luna",
-    "gpt-6-sol",
-    "gpt-6.1-sol",
-    "gpt-6.1-terra",
 ];
 
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
@@ -357,24 +340,10 @@ const KIMI_CLI: PlaceholderCli = PlaceholderCli { provider: "kimi" };
 const CURSOR_CLI: PlaceholderCli = PlaceholderCli { provider: "cursor" };
 const GROK_CLI: PlaceholderCli = PlaceholderCli { provider: "grok" };
 pub(crate) fn expand_codex_models() -> Vec<String> {
-    let mut set = HashSet::new();
     let mut out = Vec::new();
-    // Baseline ∪ models the Codex CLI advertises in its own model cache, so a
-    // model OpenAI ships to Codex routes here before a proxy release lists it.
-    let catalog = crate::providers::codex::translate::model_allowlist::listed_catalog_models();
-    for model in CODEX_MODELS
-        .iter()
-        .map(|model| (*model).to_string())
-        .chain(catalog)
-    {
-        if set.insert(model.clone()) {
-            out.push(model.clone());
-        }
-        for variant in tier_model_variants(&model) {
-            if set.insert(variant.clone()) {
-                out.push(variant);
-            }
-        }
+    for model in allowed_models() {
+        out.extend(tier_model_variants(&model));
+        out.push(model);
     }
     out.sort_unstable();
     out
