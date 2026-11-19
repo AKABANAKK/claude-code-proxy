@@ -23,6 +23,8 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-6-sol",
     "gpt-6.1-sol",
     "gpt-6.1-terra",
+    "gpt-6.2-astra",
+    "gpt-6.2-sol",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -58,11 +60,7 @@ pub fn is_allowed_model(model: &str) -> bool {
 /// for listings and error messages.
 pub fn allowed_models() -> Vec<String> {
     let mut set: BTreeSet<String> = ALLOWED_MODELS.iter().map(|m| (*m).to_string()).collect();
-    for entry in catalog_models() {
-        if entry.supported_in_api && entry.listed {
-            set.insert(entry.slug);
-        }
-    }
+    set.extend(listed_catalog_models());
     set.into_iter().collect()
 }
 
@@ -83,7 +81,7 @@ pub fn allowed_models_display() -> String {
 
 /// Models whose Codex catalog entry offers the `ultrafast` service tier.
 /// Every other model offers `priority` at most, so it gets no `-ultrafast` form.
-pub const ULTRAFAST_MODELS: &[&str] = &["gpt-6-astra", "gpt-6.1-sol"];
+pub const ULTRAFAST_MODELS: &[&str] = &["gpt-6-astra", "gpt-6.1-sol", "gpt-6.2-sol"];
 
 const FAST_SUFFIX: &str = "-fast";
 const ULTRAFAST_SUFFIX: &str = "-ultrafast";
@@ -207,6 +205,8 @@ pub fn uses_responses_lite(model: &str) -> bool {
             | "gpt-6-sol"
             | "gpt-6.1-sol"
             | "gpt-6.1-terra"
+            | "gpt-6.2-astra"
+            | "gpt-6.2-sol"
     ) || (!ALLOWED_MODELS.contains(&model)
         && catalog_model(model)
             .is_some_and(|entry| entry.supported_in_api && entry.use_responses_lite))

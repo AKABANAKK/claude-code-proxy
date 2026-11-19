@@ -160,6 +160,21 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
             false,
             Some("priority"),
         ),
+        ("gpt-6.2-sol", "gpt-6.2-sol", true, None),
+        ("gpt-6.2-sol-fast", "gpt-6.2-sol", true, Some("priority")),
+        (
+            "gpt-6.2-sol-ultrafast",
+            "gpt-6.2-sol",
+            true,
+            Some("ultrafast"),
+        ),
+        ("gpt-6.2-astra", "gpt-6.2-astra", true, None),
+        (
+            "gpt-6.2-astra-fast",
+            "gpt-6.2-astra",
+            true,
+            Some("priority"),
+        ),
         ("gpt-5.4", "gpt-5.4", false, None),
         ("gpt-6.1-terra", "gpt-6.1-terra", true, None),
         ("opus", "gpt-6-sol", true, None),
@@ -192,8 +207,33 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
         );
         assert_eq!(headers["authorization"], "Bearer synthetic-access");
     }
-    for route in ["/v1/messages", "/v1/chat/completions"] {
-        let mut request = json!({"model":"gpt-test-future-fast","stream":false,
+    for (route, requested, base, tier) in [
+        (
+            "/v1/messages",
+            "gpt-test-future-fast",
+            "gpt-test-future",
+            "priority",
+        ),
+        (
+            "/v1/chat/completions",
+            "gpt-test-future-fast",
+            "gpt-test-future",
+            "priority",
+        ),
+        (
+            "/v1/messages",
+            "gpt-6.2-sol-ultrafast",
+            "gpt-6.2-sol",
+            "ultrafast",
+        ),
+        (
+            "/v1/chat/completions",
+            "gpt-6.2-astra-fast",
+            "gpt-6.2-astra",
+            "priority",
+        ),
+    ] {
+        let mut request = json!({"model":requested,"stream":false,
                 "messages":[{"role":"user","content":"synthetic"}]});
         if route == "/v1/messages" {
             request["max_tokens"] = json!(64);
@@ -212,8 +252,8 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(body["model"], "gpt-test-future");
-        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["model"], base);
+        assert_eq!(body["service_tier"], tier);
         assert!(headers.contains_key("x-openai-internal-codex-responses-lite"));
         assert!(body.get("client_metadata").is_some());
     }
@@ -254,6 +294,7 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
     }
     std::fs::remove_file(dir.path().join("config.json")).unwrap();
     for rejected in [
+        "gpt-6.2-astra-ultrafast",
         "gpt-test-denied",
         "gpt-test-incomplete",
         "gpt-test-forged-fast",
@@ -313,5 +354,23 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
         .unwrap();
     assert!(!listing.contains("gpt-test-added"));
     assert!(listing.contains("gpt-6.1-terra"));
+    let models: Value = serde_json::from_str(&listing).unwrap();
+    let ids: Vec<_> = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|model| model["id"].as_str())
+        .filter(|id| id.starts_with("gpt-6.2-"))
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "gpt-6.2-astra",
+            "gpt-6.2-astra-fast",
+            "gpt-6.2-sol",
+            "gpt-6.2-sol-fast",
+            "gpt-6.2-sol-ultrafast",
+        ]
+    );
     upstream_task.abort();
 }
