@@ -6,6 +6,7 @@ pub(crate) enum CodexFailureKind {
     Overloaded,
     Transient,
     Permanent,
+    SafetyBlock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,8 +28,21 @@ pub(crate) struct CodexEventFailure {
 }
 
 impl CodexEventFailure {
+    fn safety_block(message: &str, explicit_status: Option<u16>) -> Self {
+        Self {
+            kind: CodexFailureKind::SafetyBlock,
+            explicit_status,
+            status: 403,
+            message: message.to_owned(),
+            retry_after: None,
+        }
+    }
+
     pub fn retryable(&self) -> bool {
-        !matches!(self.kind, CodexFailureKind::Permanent)
+        !matches!(
+            self.kind,
+            CodexFailureKind::Permanent | CodexFailureKind::SafetyBlock
+        )
     }
 
     pub fn client_status(&self) -> u16 {
@@ -130,6 +144,51 @@ pub(crate) fn is_standard_max_output_tokens_incomplete(payload: &Value) -> bool 
         && event_error(payload).is_none()
 }
 
+const SAFETY_BLOCK_NOTICE: &str = "This request was blocked by our safety systems.";
+
+fn is_safety_block_notice(message: &str) -> bool {
+    message
+        .trim()
+        .strip_prefix(SAFETY_BLOCK_NOTICE)
+        .is_some_and(|rest| rest.is_empty() || rest.trim_start().starts_with("Reason:"))
+}
+
+fn safety_block_message(error: &Value) -> Option<&str> {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("detail").and_then(Value::as_str))
+        .or_else(|| error.as_str());
+    if message.is_some_and(is_safety_block_notice) {
+        return message;
+    }
+    let fallback = match error.get("code").and_then(Value::as_str)? {
+        "cyber_policy" => "This request has been flagged for possible cybersecurity risk.",
+        "bio_policy" => "Invalid request.",
+        "content_policy_violation" => SAFETY_BLOCK_NOTICE,
+        _ => return None,
+    };
+    Some(
+        message
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or(fallback),
+    )
+}
+
+/// Inspect an unsuccessful HTTP response, never normal model output.
+pub(super) fn http_safety_block_message(body: &[u8]) -> Option<String> {
+    if let Ok(payload) = serde_json::from_slice::<Value>(body) {
+        return safety_block_message(event_error(&payload).unwrap_or(&payload)).map(str::to_owned);
+    }
+    let text = std::str::from_utf8(body).ok()?.trim();
+    if is_safety_block_notice(text) {
+        return Some(text.to_owned());
+    }
+    first_event_failure(body)
+        .filter(|failure| failure.kind == CodexFailureKind::SafetyBlock)
+        .map(|failure| failure.message)
+}
+
 pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailure> {
     let event_type = payload.get("type").and_then(Value::as_str)?;
     let response_status = payload.pointer("/response/status").and_then(Value::as_str);
@@ -141,6 +200,12 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
             .pointer("/response/incomplete_details/reason")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        if reason == "content_filter" {
+            return Some(CodexEventFailure::safety_block(
+                "Incomplete response returned, reason: content_filter",
+                None,
+            ));
+        }
         return Some(CodexEventFailure {
             kind: CodexFailureKind::Transient,
             explicit_status: None,
@@ -164,6 +229,9 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
                 .and_then(Value::as_u64)
         })
         .and_then(|status| u16::try_from(status).ok());
+    if let Some(message) = safety_block_message(error.unwrap_or(payload)) {
+        return Some(CodexEventFailure::safety_block(message, explicit_status));
+    }
     let code = error
         .and_then(|value| value.get("code"))
         .and_then(Value::as_str);
@@ -174,13 +242,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         .and_then(|value| value.get("message"))
         .and_then(Value::as_str);
     let message = match (code, raw_message) {
-        (Some("cyber_policy"), None | Some("")) => {
-            "This request has been flagged for possible cybersecurity risk.".to_string()
-        }
-        (Some("cyber_policy"), Some(message)) if message.trim().is_empty() => {
-            "This request has been flagged for possible cybersecurity risk.".to_string()
-        }
-        (Some("invalid_prompt" | "bio_policy"), None) => "Invalid request.".to_string(),
+        (Some("invalid_prompt"), None) => "Invalid request.".to_string(),
         (_, Some(message)) => message.to_string(),
         _ => "Upstream error".to_string(),
     };
@@ -196,9 +258,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
                 "context_length_exceeded"
                     | "insufficient_quota"
                     | "usage_not_included"
-                    | "cyber_policy"
                     | "invalid_prompt"
-                    | "bio_policy"
             )
         ) {
         CodexFailureKind::Permanent
@@ -235,7 +295,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         413
     } else {
         explicit_status.unwrap_or(match code {
-            Some("cyber_policy" | "invalid_prompt" | "bio_policy") => 400,
+            Some("invalid_prompt") => 400,
             Some("insufficient_quota") => 429,
             Some("usage_not_included") => 403,
             _ => match kind {
@@ -243,6 +303,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
                 CodexFailureKind::Overloaded => 529,
                 CodexFailureKind::Transient => 503,
                 CodexFailureKind::Permanent => 500,
+                CodexFailureKind::SafetyBlock => 403,
             },
         })
     };
@@ -915,9 +976,9 @@ data: {"type":"response.completed","response":{"status":"completed"}}
     fn native_fatal_codes_are_not_retried_without_numeric_status() {
         for (code, status, error_type) in [
             ("context_length_exceeded", 413, "request_too_large"),
-            ("cyber_policy", 400, "invalid_request_error"),
+            ("cyber_policy", 403, "permission_error"),
             ("invalid_prompt", 400, "invalid_request_error"),
-            ("bio_policy", 400, "invalid_request_error"),
+            ("bio_policy", 403, "permission_error"),
             ("insufficient_quota", 429, "rate_limit_error"),
             ("usage_not_included", 403, "permission_error"),
         ] {

@@ -356,6 +356,33 @@ pub struct CodexResponse {
     pub transport: ActualTransport,
 }
 
+impl CodexResponse {
+    fn from_http(
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> Result<Self, CodexError> {
+        if status >= 400
+            && let Some(message) = super::events::http_safety_block_message(&body)
+        {
+            return Err(CodexError {
+                status: 403,
+                detail: Some(message.clone()),
+                message,
+                retry_after: None,
+                usage_limit: None,
+                origin: CodexErrorOrigin::Http,
+            });
+        }
+        Ok(Self {
+            status,
+            headers,
+            body,
+            transport: ActualTransport::Http,
+        })
+    }
+}
+
 pub type CodexHttpEventReceiver =
     tokio::sync::mpsc::Receiver<Result<serde_json::Value, CodexError>>;
 
@@ -1885,7 +1912,8 @@ impl CodexHttpClient {
                     });
                 }
                 Ok(response) if response.status == 403 => {
-                    let detail = String::from_utf8_lossy(&response.body).to_string();
+                    let detail = codex_status_error_message(&response.body)
+                        .unwrap_or_else(|| String::from_utf8_lossy(&response.body).to_string());
                     return Err(CodexError {
                         status: 403,
                         message: "Forbidden".to_string(),
@@ -2501,12 +2529,7 @@ impl CodexHttpClient {
             );
         }
 
-        Ok(CodexResponse {
-            body: body_bytes,
-            status,
-            headers,
-            transport: ActualTransport::Http,
-        })
+        CodexResponse::from_http(status, headers, body_bytes)
     }
 
     async fn attempt_post_search(
@@ -2608,12 +2631,7 @@ impl CodexHttpClient {
             write_upstream_response_capture(traffic, status, started_at.elapsed(), &headers, &body);
         }
 
-        Ok(CodexResponse {
-            body,
-            status,
-            headers,
-            transport: ActualTransport::Http,
-        })
+        CodexResponse::from_http(status, headers, body)
     }
 }
 

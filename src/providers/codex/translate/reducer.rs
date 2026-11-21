@@ -430,7 +430,9 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
                 CodexFailureKind::RateLimit => UpstreamErrorKind::RateLimit,
                 CodexFailureKind::Overloaded => UpstreamErrorKind::Overloaded,
                 CodexFailureKind::Transient => UpstreamErrorKind::Transient,
-                CodexFailureKind::Permanent => UpstreamErrorKind::Failed,
+                CodexFailureKind::Permanent | CodexFailureKind::SafetyBlock => {
+                    UpstreamErrorKind::Failed
+                }
             };
             let retry_after_seconds = failure
                 .retry_after

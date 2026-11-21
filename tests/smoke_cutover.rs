@@ -536,7 +536,7 @@ async fn spawn_websocket_delayed_terminal_upstream() -> String {
     addr_str
 }
 
-async fn spawn_websocket_error_upstream(message: &'static str) -> String {
+async fn spawn_websocket_error_upstream(status: u16, message: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let addr_str = format!("http://{addr}");
@@ -548,7 +548,7 @@ async fn spawn_websocket_error_upstream(message: &'static str) -> String {
             let _ = ws.next().await;
             let event = json!({
                 "type": "error",
-                "status": 400,
+                "status": status,
                 "error": {
                     "type": "invalid_request_error",
                     "param": "input",
@@ -2200,6 +2200,7 @@ async fn smoke_codex_http_incomplete_after_text_is_an_error() {
     assert!(text.contains("partial output"), "stream body: {text}");
     assert!(text.contains("event: error"), "stream body: {text}");
     assert!(text.contains("content_filter"), "stream body: {text}");
+    assert!(text.contains("permission_error"), "stream body: {text}");
     assert!(!text.contains("event: message_stop"), "stream body: {text}");
     assert!(
         !text.contains("\"stop_reason\":\"max_tokens\""),
@@ -2233,13 +2234,83 @@ async fn smoke_codex_http_preserves_permanent_policy_failure() {
     let response = call_messages("gpt-5.5").await;
 
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()["x-should-retry"], "false");
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     let value: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(value["error"]["type"], "invalid_request_error");
+    assert_eq!(value["error"]["type"], "permission_error");
     assert_eq!(value["error"]["message"], "request rejected by policy");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_safety_block_stops_500_retries() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    const NOTICE: &str =
+        "This request was blocked by our safety systems. Reason: Potentially unintended activity.";
+    async fn assert_rejection(stream: bool) {
+        let response = call_messages_body(json!({
+            "model": "gpt-6.2-astra-ultrafast", "max_tokens": 64, "stream": stream,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()["x-should-retry"], "false");
+        assert!(!response.headers().contains_key("retry-after"));
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "permission_error");
+        assert_eq!(body["error"]["message"], NOTICE);
+    }
+    for http_error in [true, false] {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &url);
+        let mock = axum::Router::new().fallback({
+            let attempts = attempts.clone();
+            move || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let error = json!({"type":"server_error","message":NOTICE});
+                    if http_error {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            [("content-type", "application/json")],
+                            json!({"error":error}).to_string(),
+                        )
+                    } else {
+                        let event = json!({"type":"error","status":500,"error":error});
+                        (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            format!("data: {event}\n\n"),
+                        )
+                    }
+                }
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        for stream in [false, true] {
+            assert_rejection(stream).await;
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    let _ws_transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+    for stream in [false, true] {
+        let url = spawn_websocket_error_upstream(500, NOTICE).await;
+        let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &url);
+        assert_rejection(stream).await;
+    }
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -2930,7 +3001,7 @@ async fn smoke_codex_websocket_context_window_error_requests_compaction() {
     let _codex_auth = write_codex_auth(config.path());
     clear_codex_websocket_pool_for_tests();
 
-    let upstream = spawn_websocket_error_upstream("input exceeds context window").await;
+    let upstream = spawn_websocket_error_upstream(400, "input exceeds context window").await;
 
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);

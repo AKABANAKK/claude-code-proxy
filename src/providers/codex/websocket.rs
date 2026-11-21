@@ -716,7 +716,13 @@ fn is_previous_response_missing(payload: &serde_json::Value) -> bool {
 }
 
 pub(super) fn event_error_status(payload: &serde_json::Value) -> Option<u16> {
-    super::events::classify_event_failure(payload).and_then(|failure| failure.explicit_status)
+    super::events::classify_event_failure(payload).and_then(|failure| {
+        if failure.kind == super::events::CodexFailureKind::SafetyBlock {
+            Some(failure.client_status())
+        } else {
+            failure.explicit_status
+        }
+    })
 }
 
 #[allow(dead_code)]
