@@ -74,6 +74,7 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
     }
     assert!(listing.contains("gpt-6.1-terra"));
     assert!(listing.contains("gpt-6-astra-ultrafast"));
+    assert!(listing.contains("gpt-6.2-astra-ultrafast"));
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -175,6 +176,12 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
             true,
             Some("priority"),
         ),
+        (
+            "gpt-6.2-astra-ultrafast",
+            "gpt-6.2-astra",
+            true,
+            Some("ultrafast"),
+        ),
         ("gpt-5.4", "gpt-5.4", false, None),
         ("gpt-6.1-terra", "gpt-6.1-terra", true, None),
         ("opus", "gpt-6-sol", true, None),
@@ -231,6 +238,18 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
             "gpt-6.2-astra-fast",
             "gpt-6.2-astra",
             "priority",
+        ),
+        (
+            "/v1/messages",
+            "gpt-6.2-astra-ultrafast",
+            "gpt-6.2-astra",
+            "ultrafast",
+        ),
+        (
+            "/v1/chat/completions",
+            "gpt-6.2-astra-ultrafast",
+            "gpt-6.2-astra",
+            "ultrafast",
         ),
     ] {
         let mut request = json!({"model":requested,"stream":false,
@@ -294,7 +313,7 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
     }
     std::fs::remove_file(dir.path().join("config.json")).unwrap();
     for rejected in [
-        "gpt-6.2-astra-ultrafast",
+        "gpt-6.1-terra-ultrafast",
         "gpt-test-denied",
         "gpt-test-incomplete",
         "gpt-test-forged-fast",
@@ -367,6 +386,7 @@ async fn catalog_drives_discovery_routing_tiers_and_lanes_in_actual_process() {
         [
             "gpt-6.2-astra",
             "gpt-6.2-astra-fast",
+            "gpt-6.2-astra-ultrafast",
             "gpt-6.2-sol",
             "gpt-6.2-sol-fast",
             "gpt-6.2-sol-ultrafast",

@@ -46,7 +46,7 @@ Append `-fast` to any registered Codex model to request `service_tier: "priority
 
 GPT-6.2 Sol and Astra are built in. Use `gpt-6.2-sol` or `gpt-6.2-astra` for standard service, or append `-fast` for priority. Both use Responses Lite by default.
 
-Use `gpt-6.2-sol-ultrafast` to request `service_tier: "ultrafast"` on Sol. The proxy also accepts `gpt-6-astra-ultrafast` and `gpt-6.1-sol-ultrafast`.
+Use `gpt-6.2-astra-ultrafast` or `gpt-6.2-sol-ultrafast` to request `service_tier: "ultrafast"` on GPT-6.2. The proxy also accepts `gpt-6-astra-ultrafast` and `gpt-6.1-sol-ultrafast`.
 
 On `/v1/messages`, `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier` takes precedence over either suffix. A forced `ultrafast` applies to models that offer it, and the proxy requests `priority` for the others. The OpenAI-compatible routes use only the suffix or, on `/v1/responses`, the request's own `service_tier`.
 
