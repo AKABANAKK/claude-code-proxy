@@ -1,6 +1,6 @@
 [package]
 name = "claude-code-proxy"
-version = "0.1.49-rc12"
+version = "0.1.49-rc13"
 description = "Anthropic-compatible proxy for Claude Code provider backends"
 edition = "2024"
 authors = ["Claude Code Proxy contributors"]
@@ -38,7 +38,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = "0.8"
 webpki-roots = "1"
-hyper-util = { version = "0.1", features = ["client-proxy"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-proxy", "tokio"] }
 url = "2"
 prost = "0.13"
 flate2 = "1.0"

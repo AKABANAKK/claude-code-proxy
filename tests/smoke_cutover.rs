@@ -2315,6 +2315,60 @@ async fn smoke_codex_safety_block_stops_500_retries() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn smoke_codex_handshake_safety_block_stops_before_sending_conversation() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _auth = write_codex_auth(config.path());
+    const NOTICE: &str =
+        "This request was blocked by our safety systems. Reason: Potentially unintended activity.";
+    for status in [StatusCode::FORBIDDEN, StatusCode::INTERNAL_SERVER_ERROR] {
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _url = EnvGuard::set(
+            "CCP_CODEX_BASE_URL",
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let mock = axum::Router::new().fallback({
+            let methods = methods.clone();
+            move |method: Method| {
+                methods.lock().unwrap().push(method);
+                async move {
+                    (
+                        status,
+                        [("retry-after", "1")],
+                        axum::Json(json!({"error":{"message":NOTICE}})),
+                    )
+                }
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        for transport in ["auto", "websocket"] {
+            let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", transport);
+            for stream in [true, false] {
+                let response = call_messages_body(json!({
+                    "model":"gpt-6.2-astra-ultrafast", "max_tokens":16, "stream":stream,
+                    "messages":[{"role":"user","content":"hello"}]
+                }))
+                .await;
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert_eq!(response.headers()["x-should-retry"], "false");
+                assert!(!response.headers().contains_key("retry-after"));
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["error"]["message"], NOTICE);
+                assert_eq!(body["error"]["type"], "permission_error");
+                assert_eq!(std::mem::take(&mut *methods.lock().unwrap()), [Method::GET]);
+            }
+        }
+        server.abort();
+    }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_http_rate_limit_snapshot_does_not_end_response() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
