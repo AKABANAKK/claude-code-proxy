@@ -1720,6 +1720,9 @@ fn usage_limit_response(limit: &events::CodexUsageLimit) -> Response {
 }
 
 fn map_codex_error_to_response(err: &client::CodexError) -> Response {
+    if err.origin == client::CodexErrorOrigin::WebSocketHandshakeSafetyBlock {
+        return non_retryable_permission_error(&err.message);
+    }
     if let Some(limit) = err.usage_limit.as_ref() {
         return usage_limit_response(limit);
     }

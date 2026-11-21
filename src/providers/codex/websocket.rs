@@ -1254,7 +1254,24 @@ fn write_websocket_response_capture(
 // ---------------------------------------------------------------------------
 
 const MAX_HANDSHAKE_ERROR_DETAIL_BYTES: usize = 1024;
+const MAX_HANDSHAKE_ERROR_BODY_BYTES: usize = 64 * 1024;
 const GENERIC_HANDSHAKE_ERROR_DETAIL: &str = "WebSocket upgrade was rejected";
+
+fn handshake_safety_block(status: u16, body: &[u8]) -> Option<CodexError> {
+    if status < 400 || status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16() {
+        return None;
+    }
+    let body = &body[..body.len().min(MAX_HANDSHAKE_ERROR_BODY_BYTES)];
+    let message = super::events::http_safety_block_message(body)?;
+    Some(CodexError {
+        status: http::StatusCode::FORBIDDEN.as_u16(),
+        message: sanitize_handshake_detail(&message),
+        detail: None,
+        retry_after: None,
+        usage_limit: None,
+        origin: CodexErrorOrigin::WebSocketHandshakeSafetyBlock,
+    })
+}
 
 fn handshake_error_detail(body: Option<&[u8]>) -> String {
     let Some(value) = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
@@ -1268,6 +1285,10 @@ fn handshake_error_detail(body: Option<&[u8]>) -> String {
     else {
         return GENERIC_HANDSHAKE_ERROR_DETAIL.to_string();
     };
+    sanitize_handshake_detail(message)
+}
+
+fn sanitize_handshake_detail(message: &str) -> String {
     let sanitized: String = message
         .chars()
         .filter(|ch| !ch.is_control() || matches!(ch, ' '))
@@ -1391,12 +1412,12 @@ fn validate_websocket_upgrade(
 
 async fn bounded_handshake_error_body(mut response: reqwest::Response) -> Vec<u8> {
     let mut body = Vec::new();
-    while body.len() < MAX_HANDSHAKE_ERROR_DETAIL_BYTES {
+    while body.len() < MAX_HANDSHAKE_ERROR_BODY_BYTES {
         let chunk = match response.chunk().await {
             Ok(Some(chunk)) => chunk,
             Ok(None) | Err(_) => break,
         };
-        let remaining = MAX_HANDSHAKE_ERROR_DETAIL_BYTES - body.len();
+        let remaining = MAX_HANDSHAKE_ERROR_BODY_BYTES - body.len();
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
     body
@@ -1732,33 +1753,6 @@ fn websocket_destination(url: &str) -> Result<(String, String), CodexError> {
     Ok((host.to_string(), authority))
 }
 
-fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> CodexError {
-    if let tokio_tungstenite::tungstenite::Error::Http(response) = error {
-        let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get(http::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        return CodexError {
-            status,
-            message: format!("WebSocket upgrade rejected with status {status}"),
-            detail: Some(GENERIC_HANDSHAKE_ERROR_DETAIL.to_string()),
-            retry_after,
-            usage_limit: None,
-            origin: CodexErrorOrigin::WebSocketHandshake,
-        };
-    }
-    CodexError {
-        status: 0,
-        message: "WebSocket upgrade request failed".to_string(),
-        detail: None,
-        retry_after: None,
-        usage_limit: None,
-        origin: CodexErrorOrigin::WebSocketHandshake,
-    }
-}
-
 enum ConnectAttemptError {
     Origin(CodexError),
     ProxyTunnel(CodexError),
@@ -1768,7 +1762,8 @@ impl ConnectAttemptError {
     fn is_origin_forbidden(&self) -> bool {
         matches!(
             self,
-            Self::Origin(error) if error.status == http::StatusCode::FORBIDDEN.as_u16()
+            Self::Origin(error) if error.origin == CodexErrorOrigin::WebSocketHandshake
+                && error.status == http::StatusCode::FORBIDDEN.as_u16()
         )
     }
 
@@ -1800,22 +1795,41 @@ async fn connect_via_http_proxy_tunnel(
     )
     .await
     .map_err(ConnectAttemptError::Origin)?;
-    let websocket_key = generate_key();
-    let subprotocols = requested_subprotocols(headers);
-    let request = tunneled_websocket_request(url, headers, &websocket_key)
-        .map_err(ConnectAttemptError::Origin)?;
-    let (websocket, response) = tokio_tungstenite::client_async(request, stream)
+    upgrade_tunneled_websocket(stream, url, headers)
         .await
-        .map_err(tungstenite_handshake_error)
-        .map_err(ConnectAttemptError::Origin)?;
-    validate_websocket_upgrade(
-        response.version(),
-        response.headers(),
+        .map_err(ConnectAttemptError::Origin)
+}
+
+async fn upgrade_tunneled_websocket(
+    stream: BoxedWebSocketIo,
+    url: &str,
+    headers: &HeaderMap,
+) -> Result<CodexWebSocketStream, CodexError> {
+    let websocket_key = generate_key();
+    let mut request = tunneled_websocket_request(url, headers, &websocket_key)?;
+    let target = request
+        .uri()
+        .path_and_query()
+        .cloned()
+        .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+    *request.uri_mut() = target.into();
+    // Read the origin's HTTP response body even when it arrives after the headers.
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+            .await
+            .map_err(|_| websocket_protocol_error("WebSocket upgrade request failed"))?;
+    tokio::spawn(connection.with_upgrades());
+    let response = sender
+        .send_request(request.map(|()| http_body_util::Empty::<bytes::Bytes>::new()))
+        .await
+        .map_err(|_| websocket_protocol_error("WebSocket upgrade request failed"))?;
+    finish_websocket_upgrade(
+        response.map(reqwest::Body::wrap).into(),
         &websocket_key,
-        &subprotocols,
+        headers,
+        false,
     )
-    .map_err(ConnectAttemptError::Origin)?;
-    Ok(websocket)
+    .await
 }
 
 async fn connect_via_http_upgrade(
@@ -1832,7 +1846,6 @@ async fn connect_via_http_upgrade(
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let websocket_key = generate_key();
-    let subprotocols = requested_subprotocols(headers);
     let mut request = websocket_client
         .get(http_url)
         .version(http::Version::HTTP_11)
@@ -1849,6 +1862,15 @@ async fn connect_via_http_upgrade(
     }
 
     let response = request.send().await.map_err(reqwest_handshake_error)?;
+    finish_websocket_upgrade(response, &websocket_key, headers, true).await
+}
+
+async fn finish_websocket_upgrade(
+    response: reqwest::Response,
+    websocket_key: &str,
+    request_headers: &HeaderMap,
+    expose_origin_error_detail: bool,
+) -> Result<CodexWebSocketStream, CodexError> {
     if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
         let status = response.status().as_u16();
         let retry_after = response
@@ -1860,7 +1882,14 @@ async fn connect_via_http_upgrade(
             GENERIC_HANDSHAKE_ERROR_DETAIL.to_string()
         } else {
             let body = bounded_handshake_error_body(response).await;
-            handshake_error_detail(Some(&body))
+            if let Some(block) = handshake_safety_block(status, &body) {
+                return Err(block);
+            }
+            if expose_origin_error_detail {
+                handshake_error_detail(Some(&body))
+            } else {
+                GENERIC_HANDSHAKE_ERROR_DETAIL.to_string()
+            }
         };
         return Err(CodexError {
             status,
@@ -1875,8 +1904,8 @@ async fn connect_via_http_upgrade(
     validate_websocket_upgrade(
         response.version(),
         response.headers(),
-        &websocket_key,
-        &subprotocols,
+        websocket_key,
+        &requested_subprotocols(request_headers),
     )?;
     let upgraded = response
         .upgrade()
@@ -4429,6 +4458,70 @@ mod tests {
         assert!(!detail.contains('\n'));
         assert!(detail.len() <= MAX_HANDSHAKE_ERROR_DETAIL_BYTES);
         assert!(detail.starts_with("safe"));
+    }
+
+    #[tokio::test]
+    async fn tunneled_upgrade_reads_delayed_chunked_safety_rejection() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (client, server) = tokio::io::duplex(8192);
+        let origin = tokio::spawn(async move {
+            let mut io = BufReader::new(server);
+            let mut line = String::new();
+            io.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "GET /responses?x=1 HTTP/1.1\r\n");
+            while line != "\r\n" {
+                line.clear();
+                assert_ne!(io.read_line(&mut line).await.unwrap(), 0);
+            }
+            io.get_mut()
+                .write_all(b"HTTP/1.1 500 Error\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            let body =
+                br#"{"error":{"code":"content_policy_violation","message":"Request denied"}}"#;
+            io.get_mut()
+                .write_all(format!("{:x}\r\n", body.len()).as_bytes())
+                .await
+                .unwrap();
+            io.get_mut().write_all(body).await.unwrap();
+            io.get_mut().write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        });
+        let result = upgrade_tunneled_websocket(
+            Box::new(client),
+            "wss://example.test/responses?x=1",
+            &HeaderMap::new(),
+        )
+        .await;
+        let error = result.err().expect("expected a policy rejection");
+        assert_eq!(
+            error.origin,
+            CodexErrorOrigin::WebSocketHandshakeSafetyBlock
+        );
+        assert_eq!(error.status, 403);
+        assert_eq!(error.message, "Request denied");
+        origin.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tunneled_upgrade_preserves_first_websocket_frame() {
+        let (client, server) = tokio::io::duplex(8192);
+        let origin = tokio::spawn(async move {
+            let mut socket = tokio_tungstenite::accept_async(server).await.unwrap();
+            socket.send(Message::Text("ready".into())).await.unwrap();
+        });
+        let mut socket = upgrade_tunneled_websocket(
+            Box::new(client),
+            "wss://example.test/responses",
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            socket.next().await.unwrap().unwrap().into_text().unwrap(),
+            "ready"
+        );
+        origin.await.unwrap();
     }
 
     #[test]

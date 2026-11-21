@@ -332,7 +332,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "claude-code-proxy"
-version = "0.1.49-rc12"
+version = "0.1.49-rc13"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -349,6 +349,7 @@ dependencies = [
  "hostname",
  "http",
  "http-body-util",
+ "hyper",
  "hyper-util",
  "jiff",
  "once_cell",
