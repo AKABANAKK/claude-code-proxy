@@ -1604,6 +1604,7 @@ fn codex_event_failure_error(
 
 fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
     match err.status {
+        403 => "permission_error",
         429 => "rate_limit_error",
         529 => "overloaded_error",
         _ if codex_error_message(err)
@@ -1746,11 +1747,7 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
             "authentication_error",
             err.detail.as_deref().unwrap_or("Authentication failed"),
         ),
-        403 => json_error(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            err.detail.as_deref().unwrap_or("Permission denied"),
-        ),
+        403 => non_retryable_permission_error(err.detail.as_deref().unwrap_or("Permission denied")),
         429 => {
             let response = json_error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1796,6 +1793,9 @@ fn map_codex_failure_to_response(message: &str) -> Response {
 }
 
 fn map_codex_event_failure_to_response(failure: &events::CodexEventFailure) -> Response {
+    if failure.kind == events::CodexFailureKind::SafetyBlock {
+        return non_retryable_permission_error(&failure.message);
+    }
     let status = StatusCode::from_u16(failure.client_status()).unwrap_or(StatusCode::BAD_GATEWAY);
     let response = json_error(status, failure.client_error_type(), &failure.message);
     if let Some(retry_after) = failure.retry_after.as_deref() {
@@ -1803,6 +1803,14 @@ fn map_codex_event_failure_to_response(failure: &events::CodexEventFailure) -> R
     } else {
         response
     }
+}
+
+fn non_retryable_permission_error(message: &str) -> Response {
+    (
+        [("x-should-retry", "false")],
+        json_error(StatusCode::FORBIDDEN, "permission_error", message),
+    )
+        .into_response()
 }
 
 fn is_context_window_overflow(message: &str) -> bool {
