@@ -79,7 +79,7 @@ pub fn allowed_models_display() -> String {
     allowed_models().join(", ")
 }
 
-/// Models whose Codex catalog entry offers the `ultrafast` service tier.
+/// Models that offer the `ultrafast` service tier in Codex.
 /// Every other model offers `priority` at most, so it gets no `-ultrafast` form.
 pub const ULTRAFAST_MODELS: &[&str] =
     &["gpt-6-astra", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol"];
@@ -225,6 +225,8 @@ pub fn uses_responses_lite_with_full_lane(model: &str, full_lane: bool) -> bool 
                 | "gpt-6-sol"
                 | "gpt-6.1-sol"
                 | "gpt-6.1-terra"
+                | "gpt-6.2-astra"
+                | "gpt-6.2-sol"
         )
     {
         return false;
@@ -273,6 +275,8 @@ mod tests {
             "gpt-6-sol",
             "gpt-6.1-sol",
             "gpt-6.1-terra",
+            "gpt-6.2-astra",
+            "gpt-6.2-sol",
         ] {
             assert!(uses_responses_lite_with_full_lane(model, false), "{model}");
             assert!(!uses_responses_lite_with_full_lane(model, true), "{model}");
