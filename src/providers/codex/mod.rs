@@ -1811,7 +1811,11 @@ fn map_codex_event_failure_to_response(failure: &events::CodexEventFailure) -> R
 fn non_retryable_permission_error(message: &str) -> Response {
     (
         [("x-should-retry", "false")],
-        json_error(StatusCode::FORBIDDEN, "permission_error", message),
+        json_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            events::anthropic_error_message("permission_error", message),
+        ),
     )
         .into_response()
 }

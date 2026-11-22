@@ -2246,6 +2246,51 @@ async fn smoke_codex_http_preserves_permanent_policy_failure() {
     assert_eq!(value["error"]["message"], "request rejected by policy");
 }
 
+const UNINTENDED_ACTIVITY_NOTICE: &str =
+    "This request was blocked by our safety systems. Reason: Potentially unintended activity.";
+const EXPECTED_SESSION_MESSAGE: &str = concat!(
+    "This request was blocked by our safety systems. Reason: Potentially unintended activity. ",
+    "This session may no longer be usable. We recommend deleting it now and starting a new one."
+);
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_safety_block_after_partial_output_includes_session_advice() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _auth = write_codex_auth(config.path());
+    let _config = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let upstream = spawn_http_upstream(|_| {
+        let events = [
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_partial"}}),
+            json!({"type":"response.output_text.delta","output_index":0,"delta":"partial output"}),
+            json!({"type":"error","status":403,"error":{"message":UNINTENDED_ACTIVITY_NOTICE}}),
+        ];
+        events.iter().map(|event| format!("data: {event}\n\n")).collect::<String>().into_bytes()
+    }).await;
+    let _base_url = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let response = call_messages_body(json!({
+        "model":"gpt-5.5", "stream":true, "max_tokens":64,
+        "messages":[{"role":"user","content":"hello"}]
+    }))
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let stream = std::str::from_utf8(&bytes).unwrap();
+    assert!(stream.contains("partial output"));
+    let error = stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str::<Value>(data).unwrap())
+        .find(|event| event["type"] == "error")
+        .unwrap();
+    assert_eq!(error["error"]["type"], "permission_error");
+    assert_eq!(error["error"]["message"], EXPECTED_SESSION_MESSAGE);
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_safety_block_stops_500_retries() {
@@ -2254,8 +2299,6 @@ async fn smoke_codex_safety_block_stops_500_retries() {
     let _codex_auth = write_codex_auth(config.path());
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
-    const NOTICE: &str =
-        "This request was blocked by our safety systems. Reason: Potentially unintended activity.";
     async fn assert_rejection(stream: bool) {
         let response = call_messages_body(json!({
             "model": "gpt-6.2-astra-ultrafast", "max_tokens": 64, "stream": stream,
@@ -2270,7 +2313,7 @@ async fn smoke_codex_safety_block_stops_500_retries() {
             .unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"]["type"], "permission_error");
-        assert_eq!(body["error"]["message"], NOTICE);
+        assert_eq!(body["error"]["message"], EXPECTED_SESSION_MESSAGE);
     }
     for http_error in [true, false] {
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -2282,7 +2325,7 @@ async fn smoke_codex_safety_block_stops_500_retries() {
             move || {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 async move {
-                    let error = json!({"type":"server_error","message":NOTICE});
+                    let error = json!({"type":"server_error","message":UNINTENDED_ACTIVITY_NOTICE});
                     if http_error {
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2309,7 +2352,7 @@ async fn smoke_codex_safety_block_stops_500_retries() {
 
     let _ws_transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
     for stream in [false, true] {
-        let url = spawn_websocket_error_upstream(500, NOTICE).await;
+        let url = spawn_websocket_error_upstream(500, UNINTENDED_ACTIVITY_NOTICE).await;
         let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &url);
         assert_rejection(stream).await;
     }
@@ -2322,8 +2365,6 @@ async fn smoke_codex_handshake_safety_block_stops_before_sending_conversation() 
     let config = TempDir::new().unwrap();
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _auth = write_codex_auth(config.path());
-    const NOTICE: &str =
-        "This request was blocked by our safety systems. Reason: Potentially unintended activity.";
     for status in [StatusCode::FORBIDDEN, StatusCode::INTERNAL_SERVER_ERROR] {
         let methods = Arc::new(Mutex::new(Vec::new()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2339,7 +2380,7 @@ async fn smoke_codex_handshake_safety_block_stops_before_sending_conversation() 
                     (
                         status,
                         [("retry-after", "1")],
-                        axum::Json(json!({"error":{"message":NOTICE}})),
+                        axum::Json(json!({"error":{"message":UNINTENDED_ACTIVITY_NOTICE}})),
                     )
                 }
             }
@@ -2360,7 +2401,7 @@ async fn smoke_codex_handshake_safety_block_stops_before_sending_conversation() 
                     .await
                     .unwrap();
                 let body: Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(body["error"]["message"], NOTICE);
+                assert_eq!(body["error"]["message"], EXPECTED_SESSION_MESSAGE);
                 assert_eq!(body["error"]["type"], "permission_error");
                 assert_eq!(std::mem::take(&mut *methods.lock().unwrap()), [Method::GET]);
             }
