@@ -346,6 +346,7 @@ pub(crate) fn expand_codex_models() -> Vec<String> {
         out.push(model);
     }
     out.sort_unstable();
+    out.dedup();
     out
 }
 
@@ -505,6 +506,10 @@ mod tests {
             "gpt-6.1-sol-fast",
             "gpt-6.1-terra",
             "gpt-6.1-terra-fast",
+            "gpt-6.2-astra",
+            "gpt-6.2-astra-fast",
+            "gpt-6.2-sol",
+            "gpt-6.2-sol-fast",
         ] {
             assert_eq!(
                 registry.provider_for_model(model, None).unwrap().name(),
