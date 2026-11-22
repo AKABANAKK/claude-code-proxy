@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::anthropic::sse::encode_sse_event;
 use crate::providers::codex::events::{
-    classify_event_failure, event_is_success_terminal, is_standard_max_output_tokens_incomplete,
-    response_is_incomplete_terminal,
+    anthropic_error_message, classify_event_failure, event_is_success_terminal,
+    is_standard_max_output_tokens_incomplete, response_is_incomplete_terminal,
 };
 use crate::traffic::TrafficCapture;
 
@@ -281,7 +281,7 @@ impl LiveStreamTranslator {
                 "type": "error",
                 "error": {
                     "type": error_type,
-                    "message": message,
+                    "message": anthropic_error_message(error_type, message),
                 }
             }),
         );

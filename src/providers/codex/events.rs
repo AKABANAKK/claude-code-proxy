@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +147,22 @@ pub(crate) fn is_standard_max_output_tokens_incomplete(payload: &Value) -> bool 
 }
 
 const SAFETY_BLOCK_NOTICE: &str = "This request was blocked by our safety systems.";
+
+pub(super) fn anthropic_error_message<'a>(error_type: &str, message: &'a str) -> Cow<'a, str> {
+    let reason = message
+        .trim()
+        .strip_prefix(SAFETY_BLOCK_NOTICE)
+        .map(str::trim);
+    if error_type == "permission_error"
+        && reason == Some("Reason: Potentially unintended activity.")
+    {
+        return Cow::Owned(format!(
+            "{} This session may no longer be usable. We recommend deleting it now and starting a new one.",
+            message.trim_end()
+        ));
+    }
+    Cow::Borrowed(message)
+}
 
 fn is_safety_block_notice(message: &str) -> bool {
     message
