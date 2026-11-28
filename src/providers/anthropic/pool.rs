@@ -10,7 +10,7 @@ use super::ratelimit::{RateLimitObservation, WATCHED_WINDOWS, WindowUsage};
 
 const FIRST_ACCOUNT_INDEX: usize = 0;
 /// How long an account stays out of rotation when the upstream gives no recovery time.
-const BLOCK_WITHOUT_RESET_HEADER_SECS: u64 = 15 * 60;
+pub(super) const BLOCK_WITHOUT_RESET_HEADER_SECS: u64 = 15 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolAccount {
@@ -213,7 +213,11 @@ impl AccountPool {
         let revision = now_unix_micros();
         state.last_response_at_micros = Some(revision);
         state.last_response_status = Some(status.as_u16());
-        for usage in &observation.windows {
+        let watched = observation
+            .windows
+            .iter()
+            .filter(|usage| WATCHED_WINDOWS.contains(&usage.window));
+        for usage in watched.clone() {
             state.window_versions.insert(usage.window, revision);
             state.windows.insert(
                 usage.window,
@@ -232,7 +236,7 @@ impl AccountPool {
             }];
         }
         let mut events = Vec::new();
-        for usage in &observation.windows {
+        for usage in watched {
             if usage.utilization >= threshold {
                 let until_unix_secs = usage.reset_at_unix_secs.unwrap_or_else(|| {
                     now_unix_secs.saturating_add(BLOCK_WITHOUT_RESET_HEADER_SECS)
@@ -551,9 +555,7 @@ impl AccountPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::anthropic::ratelimit::{
-        FABLE_WEEKLY_WINDOW, FIVE_HOUR_WINDOW, WEEKLY_WINDOW, WindowUsage,
-    };
+    use crate::providers::anthropic::ratelimit::{FABLE_WEEKLY_WINDOW, WEEKLY_WINDOW, WindowUsage};
 
     const THRESHOLD: f64 = 0.95;
     const BELOW_THRESHOLD: f64 = 0.94;
@@ -619,7 +621,7 @@ mod tests {
         running.observe(
             &selection,
             StatusCode::OK,
-            &usage(FIVE_HOUR_WINDOW, 1.0, Some(MIDDLE_RECOVERY_UNIX_SECS)),
+            &usage(WEEKLY_WINDOW, 1.0, Some(MIDDLE_RECOVERY_UNIX_SECS)),
             NOW_UNIX_SECS,
         );
         assert_eq!(
@@ -639,7 +641,7 @@ mod tests {
         assert!(running.apply_usage_refresh(&snapshot, NOW_UNIX_SECS));
         let restored = running.usage_snapshot(&selection, NOW_UNIX_SECS);
         assert_eq!(restored["eligible"], true);
-        assert!(restored["windows"]["5h"].is_null());
+        assert_eq!(restored["windows"]["7d"]["utilization"], 0.23);
         assert!(restored["windows"]["7d_oi"].is_null());
         // Recovering an account must not interrupt an account that is still usable.
         assert_eq!(
@@ -896,7 +898,11 @@ mod tests {
         let events = answer(
             &mut pool,
             StatusCode::OK,
-            &usage(FIVE_HOUR_WINDOW, THRESHOLD, Some(EARLY_RECOVERY_UNIX_SECS)),
+            &usage(
+                FABLE_WEEKLY_WINDOW,
+                THRESHOLD,
+                Some(EARLY_RECOVERY_UNIX_SECS),
+            ),
         );
 
         assert_eq!(
@@ -904,7 +910,7 @@ mod tests {
             vec![PoolEvent::Blocked {
                 account: "first".to_string(),
                 reason: BlockReason::Utilization {
-                    window: FIVE_HOUR_WINDOW,
+                    window: FABLE_WEEKLY_WINDOW,
                     utilization: THRESHOLD,
                 },
                 until_unix_secs: EARLY_RECOVERY_UNIX_SECS,
@@ -943,7 +949,7 @@ mod tests {
 
     #[test]
     fn every_present_window_can_limit_accounts_with_different_allowances() {
-        for mask in 1..8 {
+        for mask in 1..(1 << WATCHED_WINDOWS.len()) {
             let present: Vec<_> = WATCHED_WINDOWS
                 .into_iter()
                 .enumerate()
@@ -1140,7 +1146,7 @@ mod tests {
             answer(
                 &mut pool,
                 StatusCode::OK,
-                &usage(FIVE_HOUR_WINDOW, THRESHOLD, Some(recovery_unix_secs)),
+                &usage(FABLE_WEEKLY_WINDOW, THRESHOLD, Some(recovery_unix_secs)),
             );
         }
 
@@ -1224,7 +1230,7 @@ mod tests {
                     reset_at_unix_secs: Some(LATE_RECOVERY_UNIX_SECS),
                 },
                 WindowUsage {
-                    window: FIVE_HOUR_WINDOW,
+                    window: FABLE_WEEKLY_WINDOW,
                     utilization: THRESHOLD,
                     reset_at_unix_secs: Some(EARLY_RECOVERY_UNIX_SECS),
                 },
@@ -1241,13 +1247,21 @@ mod tests {
         pool.observe(
             &selection,
             StatusCode::OK,
-            &usage(FIVE_HOUR_WINDOW, THRESHOLD, Some(MIDDLE_RECOVERY_UNIX_SECS)),
+            &usage(
+                FABLE_WEEKLY_WINDOW,
+                THRESHOLD,
+                Some(MIDDLE_RECOVERY_UNIX_SECS),
+            ),
             NOW_UNIX_SECS,
         );
         answer(
             &mut pool,
             StatusCode::OK,
-            &usage(FIVE_HOUR_WINDOW, THRESHOLD, Some(MIDDLE_RECOVERY_UNIX_SECS)),
+            &usage(
+                FABLE_WEEKLY_WINDOW,
+                THRESHOLD,
+                Some(MIDDLE_RECOVERY_UNIX_SECS),
+            ),
         );
 
         assert!(
@@ -1294,14 +1308,14 @@ mod tests {
         let mut pool = pool_of(&["first", "second"], None);
         let selection = pool.select(NOW_UNIX_SECS, &[]).unwrap();
         let initial = pool.usage_snapshot(&selection, NOW_UNIX_SECS);
-        assert!(initial["windows"]["5h"].is_null());
+        assert!(initial["windows"]["7d_oi"].is_null());
         assert!(initial["lastResponseAt"].is_null());
         pool.observe(
             &selection,
             StatusCode::OK,
             &RateLimitObservation {
                 windows: vec![
-                    usage(FIVE_HOUR_WINDOW, 0.2, Some(EARLY_RECOVERY_UNIX_SECS))
+                    usage(FABLE_WEEKLY_WINDOW, 0.2, Some(EARLY_RECOVERY_UNIX_SECS))
                         .windows
                         .remove(0),
                     usage(WEEKLY_WINDOW, 0.4, Some(LATE_RECOVERY_UNIX_SECS))
@@ -1315,7 +1329,7 @@ mod tests {
         pool.observe(
             &selection,
             StatusCode::OK,
-            &usage(FIVE_HOUR_WINDOW, 0.3, Some(EARLY_RECOVERY_UNIX_SECS)),
+            &usage(FABLE_WEEKLY_WINDOW, 0.3, Some(EARLY_RECOVERY_UNIX_SECS)),
             NOW_UNIX_SECS + 1,
         );
         pool.observe(
@@ -1325,13 +1339,13 @@ mod tests {
             NOW_UNIX_SECS + 2,
         );
         let snapshot = pool.usage_snapshot(&selection, NOW_UNIX_SECS + 2);
-        assert_eq!(snapshot["windows"]["5h"]["utilization"], 0.3);
+        assert_eq!(snapshot["windows"]["7d_oi"]["utilization"], 0.3);
         assert_eq!(snapshot["windows"]["7d"]["utilization"], 0.4);
         assert_eq!(
             snapshot["windows"]["7d"]["observedAtUnixSecs"],
             NOW_UNIX_SECS
         );
-        assert!(snapshot["windows"]["7d_oi"].is_null());
+        assert!(snapshot["windows"].get("5h").is_none());
         assert!(!snapshot.to_string().contains("sk-ant-oat"));
     }
 
@@ -1374,24 +1388,24 @@ mod tests {
         pool.observe(
             &selection,
             StatusCode::OK,
-            &usage(FIVE_HOUR_WINDOW, 1.0, Some(EARLY_RECOVERY_UNIX_SECS)),
+            &usage(FABLE_WEEKLY_WINDOW, 1.0, Some(EARLY_RECOVERY_UNIX_SECS)),
             NOW_UNIX_SECS,
         );
         let elapsed = pool.usage_snapshot(&selection, EARLY_RECOVERY_UNIX_SECS);
-        assert_eq!(elapsed["windows"]["5h"]["state"], "reset_elapsed");
-        assert_eq!(elapsed["windows"]["5h"]["utilization"], 1.0);
+        assert_eq!(elapsed["windows"]["7d_oi"]["state"], "reset_elapsed");
+        assert_eq!(elapsed["windows"]["7d_oi"]["utilization"], 1.0);
         assert_eq!(elapsed["eligible"], true);
         pool.observe(
             &selection,
             StatusCode::OK,
-            &usage(FIVE_HOUR_WINDOW, 0.01, Some(LATE_RECOVERY_UNIX_SECS)),
+            &usage(FABLE_WEEKLY_WINDOW, 0.01, Some(LATE_RECOVERY_UNIX_SECS)),
             EARLY_RECOVERY_UNIX_SECS,
         );
         let recovered = pool.usage_snapshot(&selection, EARLY_RECOVERY_UNIX_SECS);
-        assert_eq!(recovered["windows"]["5h"]["state"], "below_threshold");
-        assert_eq!(recovered["windows"]["5h"]["utilization"], 0.01);
+        assert_eq!(recovered["windows"]["7d_oi"]["state"], "below_threshold");
+        assert_eq!(recovered["windows"]["7d_oi"]["utilization"], 0.01);
         assert_eq!(
-            recovered["windows"]["5h"]["resetAtUnixSecs"],
+            recovered["windows"]["7d_oi"]["resetAtUnixSecs"],
             LATE_RECOVERY_UNIX_SECS
         );
     }
@@ -1434,7 +1448,11 @@ mod tests {
             answer(
                 &mut pool,
                 StatusCode::OK,
-                &usage(FIVE_HOUR_WINDOW, THRESHOLD, Some(LATE_RECOVERY_UNIX_SECS)),
+                &usage(
+                    FABLE_WEEKLY_WINDOW,
+                    THRESHOLD,
+                    Some(LATE_RECOVERY_UNIX_SECS),
+                ),
             );
         }
         assert_eq!(

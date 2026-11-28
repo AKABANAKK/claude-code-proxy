@@ -76,6 +76,85 @@ pub(super) fn window_revision(snapshot: &Value, window: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn saved_window_deadline(usage: &Value) -> Option<u64> {
+    usage["resetAtUnixSecs"].as_u64().or_else(|| {
+        usage["observedAtUnixSecs"]
+            .as_u64()
+            .map(|at| at.saturating_add(super::pool::BLOCK_WITHOUT_RESET_HEADER_SECS))
+    })
+}
+
+pub(super) fn decode_snapshot(bytes: &[u8]) -> serde_json::Result<Value> {
+    let mut snapshot: Value = serde_json::from_slice(bytes)?;
+    let Some(five_hour) = snapshot
+        .get_mut("windows")
+        .and_then(Value::as_object_mut)
+        .and_then(|windows| windows.remove("5h"))
+    else {
+        return Ok(snapshot);
+    };
+    if let Some(versions) = snapshot
+        .get_mut("windowUpdatedAtUnixMicros")
+        .and_then(Value::as_object_mut)
+    {
+        versions.remove("5h");
+    }
+    let threshold = snapshot["switchThreshold"]
+        .as_f64()
+        .filter(|value| *value > 0.0 && *value <= 1.0)
+        .unwrap_or_else(crate::config::anthropic_switch_threshold);
+    if !five_hour["utilization"]
+        .as_f64()
+        .is_some_and(|used| used >= threshold)
+    {
+        return Ok(snapshot);
+    }
+
+    // Old snapshots cached the maximum of every quota deadline and Retry-After.
+    // Keep the actual 429 deadline and rebuild the aggregate from the weekly windows.
+    let mut until = snapshot["retryAfterUntilUnixSecs"].as_u64();
+    if snapshot.get("retryAfterUntilUnixSecs").is_none() && snapshot["lastResponseStatus"] == 429 {
+        let aggregate = snapshot["blockedUntilUnixSecs"].as_u64();
+        // Older versions had no separate retry deadline. If the aggregate was
+        // the five-hour reset, use the normal 429 fallback from the saved response.
+        until = if aggregate.is_some() && aggregate != saved_window_deadline(&five_hour) {
+            aggregate
+        } else {
+            snapshot["lastResponseAtUnixMicros"]
+                .as_u64()
+                .map(|ts| ts / 1_000_000)
+                .or_else(|| snapshot["asOfUnixSecs"].as_u64())
+                .or_else(|| five_hour["observedAtUnixSecs"].as_u64())
+                .map(|at| at.saturating_add(super::pool::BLOCK_WITHOUT_RESET_HEADER_SECS))
+        };
+        snapshot["retryAfterUntilUnixSecs"] = json!(until);
+    }
+    let mut unknown_deadline = false;
+    for window in WATCHED_WINDOWS {
+        let usage = &snapshot["windows"][window];
+        if usage["utilization"]
+            .as_f64()
+            .is_some_and(|used| used >= threshold)
+        {
+            match saved_window_deadline(usage) {
+                Some(reset) => until = Some(until.map_or(reset, |deadline| deadline.max(reset))),
+                None => unknown_deadline = true,
+            }
+        }
+    }
+    let as_of = snapshot["asOfUnixSecs"]
+        .as_u64()
+        .unwrap_or_else(|| now_unix_micros() / 1_000_000);
+    snapshot["blockedUntilUnixSecs"] = json!(until);
+    snapshot["blockedUntil"] = json!(until.and_then(timestamp));
+    snapshot["eligible"] = json!(
+        snapshot["invalid"].as_bool() != Some(true)
+            && !unknown_deadline
+            && until.is_none_or(|until| until <= as_of)
+    );
+    Ok(snapshot)
+}
+
 fn merge_refresh(previous: &Value, next: &Value) -> Value {
     let previous_time = previous["lastResponseAtUnixMicros"].as_u64().unwrap_or(0);
     let next_time = next["lastResponseAtUnixMicros"].as_u64().unwrap_or(0);
@@ -124,7 +203,7 @@ impl UsageFiles {
                 return Err(err).with_context(|| format!("Cannot read {}", path.display()));
             }
         };
-        let snapshot: Value = serde_json::from_slice(&bytes)
+        let snapshot = decode_snapshot(&bytes)
             .with_context(|| format!("Invalid account usage snapshot: {}", path.display()))?;
         anyhow::ensure!(
             snapshot["account"].as_str() == Some(account),
@@ -166,7 +245,7 @@ impl UsageFiles {
                     .as_str()
                     .context("Missing account in usage refresh")?;
                 let previous = match std::fs::read(self.refresh_path(account)) {
-                    Ok(raw) => Some(serde_json::from_slice::<Value>(&raw)?),
+                    Ok(raw) => Some(decode_snapshot(&raw)?),
                     Err(err) if err.kind() == io::ErrorKind::NotFound => None,
                     Err(err) => return Err(err.into()),
                 };
@@ -458,7 +537,7 @@ mod tests {
     fn read_uses_the_encoded_filename_without_starting_a_writer() {
         let directory = tempfile::TempDir::new().unwrap();
         let account = "../Work Account";
-        let snapshot = json!({"account": account, "windows": {"5h": {"utilization": 0.4}}});
+        let snapshot = json!({"account": account, "windows": {"7d": {"utilization": 0.4}}});
         write_snapshot(directory.path(), account, &snapshot).unwrap();
         let files = UsageFiles::new(directory.path().to_path_buf());
         assert_eq!(files.read(account).unwrap(), Some(snapshot));
@@ -485,9 +564,9 @@ mod tests {
     async fn usage_file_is_replaced_with_complete_json() {
         let directory = tempfile::TempDir::new().unwrap();
         let files = UsageFiles::new(directory.path().to_path_buf());
-        files.write("first", json!({"windows": {"5h": null}}));
+        files.write("first", json!({"windows": {"7d": null}}));
         files.flush().await;
-        let updated = json!({"windows": {"5h": {"utilization": 0.3}}});
+        let updated = json!({"windows": {"7d": {"utilization": 0.3}}});
         files.write("first", updated.clone());
         files.flush().await;
         let path = directory.path().join("first.json");

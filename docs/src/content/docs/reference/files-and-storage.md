@@ -56,7 +56,7 @@ These files contain no tokens and use mode `0600` on Unix.
 
 At server startup, the proxy initializes files for every loaded account and sends
 one small `claude-fable-5-1` request per account (`max_tokens: 1`, no streaming).
-Fable responses can report all three watched windows, including `7d_oi`.
+Fable responses can report both weekly windows (`7d` and `7d_oi`).
 Up to three probes run concurrently, each with a ten-second timeout. The proxy
 finishes these checks before accepting client requests. They consume a small
 amount of allowance and can start an unused five-hour window.
@@ -97,8 +97,7 @@ retain previously saved windows so an omitted exhausted limit is not lost.
 `anthropic accounts update` explicitly probes all registered accounts and saves
 the refreshed snapshots before returning. It preserves the last selection.
 When a successful probe returns usage headers, its reported window set replaces the old
-snapshot: omitted windows such as `5h` or `7d_oi` remain `null` and do not affect
-availability, rather than being restored from an older observation. Connection failures,
+snapshot. An omitted weekly window has a `null` value and does not affect availability. Connection failures,
 server errors, and responses without usage headers preserve the previous usage;
 401 and 429 responses can still update invalidation or block status. Storage
 failures and partial refresh failures cause a nonzero exit.
@@ -138,7 +137,7 @@ unobserved windows; failed or empty probes do not release known limits.
 | `eligible` | Whether the local pool permits selection at `asOf`; this is not confirmation of remaining upstream allowance. |
 | `invalid` | Whether a 401 has invalidated the account in this process. |
 | `blockedUntil` / `blockedUntilUnixSecs` | Latest local block expiry, or `null`. Several windows or a 429 can extend this beyond any individual window reset. |
-| `windows` | Keys `5h`, `7d`, and `7d_oi`, each containing its latest observation or `null` when unknown. |
+| `windows` | Keys `7d` and `7d_oi`, each containing its latest observation or `null` when unknown. |
 
 Each known window contains `utilization` (a fraction, so `0.98` means 98%),
 `observedAt` / `observedAtUnixSecs`, `resetAt` / `resetAtUnixSecs`, and `state`.

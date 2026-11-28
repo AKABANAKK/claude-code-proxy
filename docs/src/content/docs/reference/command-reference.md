@@ -99,20 +99,19 @@ claude-code-proxy anthropic accounts remove <name>
 
 `add` prompts for one token on standard input; the token is not a command-line
 argument. Names must be nonempty and unique. `list` displays an aligned table
-with seven English column names. These exact names are also the sort keys:
+with the following sortable columns.
 
 | Column | Content | Comparison |
 | --- | --- | --- |
 | `name` | Row number and account name | Account name as text |
 | `status` | Last observed selection and authentication status | Displayed status as text |
 | `available_at` | Estimated time the account becomes usable | Time; `今すぐ` precedes future times in ascending order |
-| `5h` | Five-hour usage percentage and reset time | Numeric usage percentage |
 | `7d` | Weekly usage percentage and reset time | Numeric usage percentage |
 | `7d_oi` | Observed `7d_oi` usage percentage and reset time | Numeric usage percentage |
 | `added_at` | Registration date | Full registration timestamp |
 
 Without a sort argument, accounts appear in registration order. Specify
-`list <column>:asc` or `list <column>:desc` to sort any of the seven columns.
+`list <column>:asc` or `list <column>:desc` to sort by any displayed column.
 For example, `list available_at:asc` shows available accounts first, then blocked
 accounts in estimated recovery order. `list 7d:desc` sorts by weekly usage,
 highest first. Missing sort values remain last in either direction. When sorting
@@ -121,8 +120,7 @@ recovery times. Equal values retain registration order. All accounts remain
 visible, and sorting never changes registrations or account selection.
 
 The `available_at` column shows `今すぐ`, an estimated recovery time, `不明`,
-or `要再認証`. Recovery waits for all exhausted windows, so a weekly limit can
-keep an account blocked after its five-hour window resets. A retry deadline
+or `要再認証`. Recovery waits for the latest reset among exhausted weekly windows. A retry deadline
 without quota-window data is not treated as a known reset time. Reset times use
 `yyyy/mm/dd hh:mm` in the system's local time zone; `--` means the reset time is
 unknown.

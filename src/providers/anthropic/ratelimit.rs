@@ -7,14 +7,12 @@ const UTILIZATION_HEADER_SUFFIX: &str = "-utilization";
 const RESET_HEADER_SUFFIX: &str = "-reset";
 const RETRY_AFTER_HEADER: &str = "retry-after";
 
-pub const FIVE_HOUR_WINDOW: &str = "5h";
 pub const WEEKLY_WINDOW: &str = "7d";
 /// The weekly window of Fable.
 pub const FABLE_WEEKLY_WINDOW: &str = "7d_oi";
 
 /// Windows whose utilization is compared with the switch threshold.
-pub(super) const WATCHED_WINDOWS: [&str; 3] =
-    [FIVE_HOUR_WINDOW, WEEKLY_WINDOW, FABLE_WEEKLY_WINDOW];
+pub(super) const WATCHED_WINDOWS: [&str; 2] = [WEEKLY_WINDOW, FABLE_WEEKLY_WINDOW];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowUsage {
@@ -119,11 +117,6 @@ mod tests {
             RateLimitObservation {
                 windows: vec![
                     WindowUsage {
-                        window: FIVE_HOUR_WINDOW,
-                        utilization: 0.95,
-                        reset_at_unix_secs: Some(FIVE_HOUR_RESET_UNIX_SECS),
-                    },
-                    WindowUsage {
                         window: WEEKLY_WINDOW,
                         utilization: 0.58,
                         reset_at_unix_secs: Some(WEEKLY_RESET_UNIX_SECS),
@@ -143,8 +136,8 @@ mod tests {
     fn skips_windows_without_numeric_utilization() {
         let headers = headers_of(&[
             (
-                "anthropic-ratelimit-unified-5h-reset",
-                FIVE_HOUR_RESET_UNIX_SECS.to_string(),
+                "anthropic-ratelimit-unified-7d_oi-reset",
+                WEEKLY_RESET_UNIX_SECS.to_string(),
             ),
             (
                 "anthropic-ratelimit-unified-7d-utilization",
@@ -158,14 +151,14 @@ mod tests {
     #[test]
     fn missing_reset_leaves_reset_time_unknown() {
         let headers = headers_of(&[(
-            "anthropic-ratelimit-unified-5h-utilization",
+            "anthropic-ratelimit-unified-7d_oi-utilization",
             "0.5".to_string(),
         )]);
 
         assert_eq!(
             observe(&headers).windows,
             vec![WindowUsage {
-                window: FIVE_HOUR_WINDOW,
+                window: FABLE_WEEKLY_WINDOW,
                 utilization: 0.5,
                 reset_at_unix_secs: None,
             }]
@@ -185,7 +178,7 @@ mod tests {
     #[test]
     fn over_limit_utilization_remains_a_fraction() {
         let headers = headers_of(&[(
-            "anthropic-ratelimit-unified-5h-utilization",
+            "anthropic-ratelimit-unified-7d_oi-utilization",
             "1.25".to_string(),
         )]);
 
@@ -196,7 +189,7 @@ mod tests {
     fn skips_negative_and_non_finite_utilization() {
         for value in ["-0.1", "NaN", "inf", "-inf"] {
             let headers = headers_of(&[(
-                "anthropic-ratelimit-unified-5h-utilization",
+                "anthropic-ratelimit-unified-7d_oi-utilization",
                 value.to_string(),
             )]);
 
@@ -208,11 +201,11 @@ mod tests {
     fn malformed_recovery_headers_leave_recovery_time_unknown() {
         let headers = headers_of(&[
             (
-                "anthropic-ratelimit-unified-5h-utilization",
+                "anthropic-ratelimit-unified-7d_oi-utilization",
                 "0.99".to_string(),
             ),
             (
-                "anthropic-ratelimit-unified-5h-reset",
+                "anthropic-ratelimit-unified-7d_oi-reset",
                 "invalid".to_string(),
             ),
             ("retry-after", "-1".to_string()),

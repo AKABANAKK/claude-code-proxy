@@ -279,7 +279,8 @@ impl AccountRelay {
                 if previous.get(&name) == Some(&stamp) {
                     return Ok(None);
                 }
-                let snapshot: Value = serde_json::from_slice(&tokio::fs::read(path).await?)?;
+                let snapshot =
+                    super::account_usage::decode_snapshot(&tokio::fs::read(path).await?)?;
                 anyhow::ensure!(
                     snapshot["account"].as_str() == Some(name.as_str()),
                     "Account does not match usage refresh"
