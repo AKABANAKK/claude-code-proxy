@@ -180,11 +180,9 @@ through `100`: `0.98` and `98` both mean 98%. Invalid values fall through to the
 next source in the precedence order. Upstream utilization headers are always
 read as fractions, including values above `1.0`.
 
-The watched windows are `5h`, `7d`, and `7d_oi`, whenever their utilization
-headers are present; the requested model does not change which windows count.
-All reported windows apply together: reaching the threshold in any one of them
-blocks the account. Accounts may have no `5h` or `7d_oi` window; absent windows
-are excluded from this comparison. Explicit usage refreshes replace the window
+The proxy watches the weekly (`7d`) and Fable weekly (`7d_oi`) windows for every Claude model.
+It compares the usage reported for each window with the threshold. Reaching the
+threshold in either window blocks the account. Explicit usage refreshes replace the window
 set when usage headers are returned, without restoring omitted limits from an
 older snapshot.
 An account at or above the threshold is blocked until the reported reset time,

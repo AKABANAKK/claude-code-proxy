@@ -50,18 +50,16 @@ enum AccountColumn {
     Name,
     Status,
     AvailableAt,
-    FiveHour,
     SevenDay,
     SevenDayOi,
     AddedAt,
 }
 
 impl AccountColumn {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 6] = [
         Self::Name,
         Self::Status,
         Self::AvailableAt,
-        Self::FiveHour,
         Self::SevenDay,
         Self::SevenDayOi,
         Self::AddedAt,
@@ -72,7 +70,6 @@ impl AccountColumn {
             Self::Name => "name",
             Self::Status => "status",
             Self::AvailableAt => "available_at",
-            Self::FiveHour => "5h",
             Self::SevenDay => "7d",
             Self::SevenDayOi => "7d_oi",
             Self::AddedAt => "added_at",
@@ -154,7 +151,6 @@ impl AccountsListSort {
                 matches!(left.availability, AccountAvailability::Invalid)
                     .cmp(&matches!(right.availability, AccountAvailability::Invalid))
             }),
-            AccountColumn::FiveHour => compare_window("5h"),
             AccountColumn::SevenDay => compare_window("7d"),
             AccountColumn::SevenDayOi => compare_window("7d_oi"),
             AccountColumn::AddedAt => compare_sort_values(
@@ -314,11 +310,6 @@ fn list_accounts(
             format_account_availability(availability, &time_zone),
             format!(
                 "{} (reset {})",
-                format_window_usage(snapshot, "5h", now),
-                format_window_reset_date(snapshot, "5h", &time_zone),
-            ),
-            format!(
-                "{} (reset {})",
                 format_window_usage(snapshot, "7d", now),
                 format_window_reset_date(snapshot, "7d", &time_zone),
             ),
@@ -331,7 +322,7 @@ fn list_accounts(
         ]
     }));
     // Terminal cell widths keep Japanese names and statuses aligned too.
-    let widths: [usize; 7] = std::array::from_fn(|column| {
+    let widths: [usize; AccountColumn::ALL.len()] = std::array::from_fn(|column| {
         rows.iter()
             .map(|row| row[column].width())
             .max()

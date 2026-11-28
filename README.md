@@ -145,8 +145,8 @@ in normally, with `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` unset. Restart
 the proxy after adding or removing accounts. Once accounts are registered, the
 proxy replaces the forwarded `Authorization` header with the selected token.
 
-The proxy stays on one account until a reported five-hour, weekly, or `7d_oi`
-weekly window reaches **98%** usage, then advances in registration order,
+The proxy stays on one account until the weekly (`7d`) or Fable weekly
+(`7d_oi`) window reaches **98%** usage, then advances in registration order,
 wrapping to the first account. A recovered account does not interrupt the current
 one. Set `CCP_ANTHROPIC_SWITCH_THRESHOLD=0.95` (or `95`) to switch at 95%, or
 `CCP_ANTHROPIC_ACTIVE_ACCOUNT=work` to choose the account used at startup.
@@ -168,7 +168,7 @@ blocked, and invalid accounts, with `allAccountsUnavailable` when none are eligi
 Usage snapshots are stored separately, one JSON file per account, under
 `<state-root>/anthropic/accounts/` (for example,
 `~/.local/state/claude-code-proxy/anthropic/accounts/first.json`). They include
-the last observed utilization, observation time, and reset time for `5h`, `7d`,
+the last observed utilization, observation time, and reset time for `7d`
 and `7d_oi`. At server startup, the proxy refreshes every registered account with
 one small Fable request (`max_tokens: 1`) before accepting client requests. This
 consumes a small amount of allowance and can start an unused five-hour window.

@@ -20,6 +20,7 @@ const MOCK_IMMEDIATE_RETRY_RESPONSE: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\
 const MOCK_UNAUTHORIZED_RESPONSE: &[u8] = b"HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
 /// A 200 reporting the five-hour window as fully used until a reset far in the future.
 const MOCK_OK_FIVE_HOUR_EXHAUSTED_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nanthropic-ratelimit-unified-5h-utilization: 1.0\r\nanthropic-ratelimit-unified-5h-reset: 4102444800\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+const MOCK_OK_WEEKLY_EXHAUSTED_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nanthropic-ratelimit-unified-7d-utilization: 1.0\r\nanthropic-ratelimit-unified-7d-reset: 4102444800\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
 const FIRST_ACCOUNT_NAME: &str = "test-first";
 const FIRST_TOKEN: &str = "sk-ant-oat-test-first";
 const SECOND_ACCOUNT_NAME: &str = "test-second";
@@ -428,7 +429,7 @@ async fn relay_retries_rate_limited_request_with_next_account() {
 }
 
 #[tokio::test]
-async fn relay_switches_account_after_usage_reaches_threshold() {
+async fn exhausted_five_hour_headers_keep_the_selected_account() {
     let (requests, responses) = relay_through_mock_upstream(
         Some(two_account_pool()),
         vec![MOCK_OK_FIVE_HOUR_EXHAUSTED_RESPONSE, MOCK_OK_RESPONSE],
@@ -441,7 +442,7 @@ async fn relay_switches_account_after_usage_reaches_threshold() {
         vec![StatusCode::OK, StatusCode::OK]
     );
     assert!(sent_with(&requests[0], FIRST_TOKEN), "{}", requests[0]);
-    assert!(sent_with(&requests[1], SECOND_TOKEN), "{}", requests[1]);
+    assert!(sent_with(&requests[1], FIRST_TOKEN), "{}", requests[1]);
 }
 
 #[tokio::test]
@@ -751,7 +752,7 @@ async fn relay_saves_account_usage_and_unknown_windows_without_tokens() {
     let directory = tempfile::TempDir::new().unwrap();
     let (_, responses) = relay_through_mock_with_usage_directory(
         Some(two_account_pool()),
-        vec![MOCK_OK_FIVE_HOUR_EXHAUSTED_RESPONSE, MOCK_OK_RESPONSE],
+        vec![MOCK_OK_WEEKLY_EXHAUSTED_RESPONSE, MOCK_OK_RESPONSE],
         2,
         Some(directory.path().to_path_buf()),
     )
@@ -764,11 +765,11 @@ async fn relay_saves_account_usage_and_unknown_windows_without_tokens() {
     let first: serde_json::Value = serde_json::from_str(&first_text).unwrap();
     assert_eq!(first["account"], FIRST_ACCOUNT_NAME);
     assert_eq!(first["active"], false);
-    assert_eq!(first["windows"]["5h"]["utilization"], 1.0);
-    assert_eq!(first["windows"]["5h"]["resetAt"], "2100-01-01T00:00:00Z");
-    assert_eq!(first["windows"]["5h"]["resetAtUnixSecs"], 4102444800_u64);
+    assert_eq!(first["windows"]["7d"]["utilization"], 1.0);
+    assert_eq!(first["windows"]["7d"]["resetAt"], "2100-01-01T00:00:00Z");
+    assert_eq!(first["windows"]["7d"]["resetAtUnixSecs"], 4102444800_u64);
     assert_eq!(first["eligible"], false);
-    assert!(first["windows"]["7d"].is_null());
+    assert!(first["windows"].get("5h").is_none());
     assert!(first["windows"]["7d_oi"].is_null());
     assert!(!first_text.contains(FIRST_TOKEN));
     let second: serde_json::Value =
@@ -776,7 +777,7 @@ async fn relay_saves_account_usage_and_unknown_windows_without_tokens() {
             .unwrap();
     assert_eq!(second["lastResponseStatus"], 200);
     assert_eq!(second["active"], true);
-    assert!(second["windows"]["5h"].is_null());
+    assert!(second["windows"].get("5h").is_none());
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
 }
 
@@ -824,7 +825,7 @@ async fn first_relay_creates_snapshots_for_all_six_loaded_accounts() {
         )
         .unwrap();
         assert_eq!(snapshot["account"], name);
-        assert!(snapshot["windows"]["5h"].is_null());
+        assert!(snapshot["windows"].get("5h").is_none());
         assert!(snapshot["windows"]["7d"].is_null());
         assert!(snapshot["windows"]["7d_oi"].is_null());
         if name == "first" {
@@ -860,7 +861,7 @@ async fn startup_refresh_handles_failures_and_preserves_the_preferred_account() 
             let response: &[u8] = if sent_with(&request, "test-token-first") {
                 MOCK_TOO_MANY_REQUESTS_RESPONSE
             } else if sent_with(&request, "test-token-second") && requests.len() < 6 {
-                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\nanthropic-ratelimit-unified-5h-utilization: 0.41\r\nanthropic-ratelimit-unified-5h-reset: 4102444800\r\n\r\n{}"
+                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\nanthropic-ratelimit-unified-7d-utilization: 0.41\r\nanthropic-ratelimit-unified-7d-reset: 4102444800\r\n\r\n{}"
             } else if sent_with(&request, "test-token-third") {
                 MOCK_UNAUTHORIZED_RESPONSE
             } else if sent_with(&request, "test-token-fourth") {
@@ -896,12 +897,17 @@ async fn startup_refresh_handles_failures_and_preserves_the_preferred_account() 
     assert_eq!(snapshots[0]["lastResponseStatus"], 429);
     assert_eq!(snapshots[0]["eligible"], false);
     assert_eq!(snapshots[1]["eligible"], true);
-    assert_eq!(snapshots[1]["windows"]["5h"]["utilization"], 0.41);
+    assert_eq!(snapshots[1]["windows"]["7d"]["utilization"], 0.41);
     assert_eq!(snapshots[2]["invalid"], true);
-    assert_eq!(snapshots[3]["eligible"], false);
-    assert_eq!(snapshots[3]["windows"]["5h"]["utilization"], 1.0);
+    assert_eq!(snapshots[3]["eligible"], true);
+    assert!(snapshots[3]["windows"].get("5h").is_none());
+    assert!(
+        snapshots[3]["windowUpdatedAtUnixMicros"]
+            .get("5h")
+            .is_none()
+    );
     assert!(snapshots[4]["lastResponseStatus"].is_null());
-    assert!(snapshots[4]["windows"]["5h"].is_null());
+    assert!(snapshots[4]["windows"].get("5h").is_none());
     assert_eq!(snapshots[5]["lastResponseStatus"], 503);
 
     let response = tokio::time::timeout(Duration::from_secs(5), relay_request(&provider))
